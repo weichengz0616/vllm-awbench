@@ -21,6 +21,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    FreeBlockEvictionPolicy,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     estimate_max_model_len,
@@ -374,6 +375,32 @@ def test_free_kv_cache_block_queue_popleft_n():
     for block in result_blocks:
         assert block.prev_free_block is None
         assert block.next_free_block is None
+
+
+def test_free_kv_cache_block_queue_custom_eviction_policy():
+    class TailEvictionPolicy(FreeBlockEvictionPolicy):
+        def select_victims(
+            self, queue: FreeKVCacheBlockQueue, n: int
+        ) -> list[KVCacheBlock]:
+            victims = []
+            for _ in range(n):
+                block = queue.fake_free_list_tail.prev_free_block
+                assert block is not None
+                queue.remove(block)
+                victims.append(block)
+            return victims
+
+        def insert_free_blocks(
+            self, queue: FreeKVCacheBlockQueue, blocks: list[KVCacheBlock]
+        ) -> None:
+            queue._append_tail_n(blocks)
+
+    blocks = [KVCacheBlock(block_id=i) for i in range(4)]
+    queue = FreeKVCacheBlockQueue(blocks, eviction_policy=TailEvictionPolicy())
+
+    assert queue.popleft() is blocks[3]
+    assert queue.popleft_n(2) == [blocks[2], blocks[1]]
+    assert queue.get_all_free_blocks() == [blocks[0]]
 
 
 def test_free_kv_cache_block_queue_get_all_free_blocks():

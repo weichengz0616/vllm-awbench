@@ -39,6 +39,13 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.sched.offload_policy import (
+    DefaultOffloadPolicy,
+    KVTransferPlan,
+    LoadDecisionContext,
+    LoadRequestInfo,
+    OffloadDecisionContext,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -154,6 +161,7 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+        self.offload_policy = DefaultOffloadPolicy()
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
@@ -271,6 +279,16 @@ class Scheduler(SchedulerInterface):
                 vllm_config=self.vllm_config,
             )
 
+    def _get_offload_policy_state(self):
+        if self.connector is None:
+            return None
+
+        get_policy_state = getattr(self.connector, "get_offload_policy_state", None)
+        if get_policy_state is None:
+            return None
+
+        return get_policy_state()
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -337,6 +355,7 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        load_request_infos: list[LoadRequestInfo] = []
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -537,6 +556,7 @@ class Scheduler(SchedulerInterface):
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
+                load_plan = None
 
                 # KVTransfer: skip request if still waiting for remote kvs.
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
@@ -608,22 +628,24 @@ class Scheduler(SchedulerInterface):
                                 request, num_new_local_computed_tokens
                             )
                         )
+                    else:
+                        ext_tokens = 0
 
-                        if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            self.waiting.pop_request()
-                            skipped_waiting_requests.prepend_request(request)
-                            continue
+                    if ext_tokens is None:
+                        # The request cannot be scheduled because the
+                        # KVConnector couldn't determine the number of matched
+                        # tokens.
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
-                        request.num_external_computed_tokens = ext_tokens
-                        num_external_computed_tokens = ext_tokens
+                    request.num_external_computed_tokens = ext_tokens
+                    num_external_computed_tokens = ext_tokens
 
-                        connector_prefix_cache_queries = (
-                            request.num_tokens - num_new_local_computed_tokens
-                        )
-                        connector_prefix_cache_hits = num_external_computed_tokens
+                    connector_prefix_cache_queries = (
+                        request.num_tokens - num_new_local_computed_tokens
+                    )
+                    connector_prefix_cache_hits = num_external_computed_tokens
 
                     # Total computed tokens (local + external).
                     num_computed_tokens = (
@@ -740,6 +762,22 @@ class Scheduler(SchedulerInterface):
                         self.kv_cache_manager.get_blocks(request_id),
                         num_external_computed_tokens,
                     )
+                    if load_kv_async:
+                        load_request_infos.append(
+                            LoadRequestInfo(
+                                request=request,
+                                num_local_computed_tokens=(
+                                    num_new_local_computed_tokens
+                                ),
+                                num_external_computed_tokens=(
+                                    num_external_computed_tokens
+                                ),
+                                load_kv_async=load_kv_async,
+                                allocated_blocks=self.kv_cache_manager.get_blocks(
+                                    request_id
+                                ),
+                            )
+                        )
                     if (
                         self.connector_prefix_cache_stats is not None
                         and connector_prefix_cache_queries != 0
@@ -874,6 +912,34 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
         )
 
+        load_plan = self.offload_policy.get_load_plan(
+            LoadDecisionContext(
+                request_infos=load_request_infos,
+                offload_state=self._get_offload_policy_state(),
+                kv_cache_manager=self.kv_cache_manager,
+                token_budget=token_budget,
+                max_num_running_reqs=self.max_num_running_reqs,
+                num_running_reqs=len(self.running),
+            )
+        )
+        offload_plan = self.offload_policy.get_offload_plan(
+            OffloadDecisionContext(
+                scheduler_output=scheduler_output,
+                requests=self.requests,
+                offload_state=self._get_offload_policy_state(),
+                kv_cache_manager=self.kv_cache_manager,
+                running=self.running,
+                waiting=list(self.waiting),
+                preempted_req_ids=scheduler_output.preempted_req_ids or set(),
+            )
+        )
+        transfer_plan = KVTransferPlan(
+            loads=[load_plan] if load_plan.block_ranges else [],
+            offloads=[offload_plan] if offload_plan.block_ranges else [],
+        )
+        if not transfer_plan.is_empty():
+            scheduler_output.offload_plan = transfer_plan
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -883,6 +949,9 @@ class Scheduler(SchedulerInterface):
                 scheduler_output
             )
             scheduler_output.kv_connector_metadata = meta
+            self.offload_policy.update_after_connector_meta(
+                scheduler_output.offload_plan
+            )
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -1909,6 +1978,7 @@ class Scheduler(SchedulerInterface):
         )
 
         block_ids = self.kv_cache_manager.get_block_ids(request.request_id)
+        self.offload_policy.request_finished(request)
 
         if not isinstance(self.connector, SupportsHMA):
             # NOTE(Kuntai): We should deprecate this code path after we enforce

@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     BlockHashWithGroupId,
     ExternalBlockHash,
+    FreeBlockEvictionPolicy,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
     get_block_hash,
@@ -142,6 +143,8 @@ class BlockPool:
             actual block size can be a multiple of hash_block_size.
         enable_kv_cache_events: Whether to enable kv cache events.
         metrics_collector: Optional metrics collector for tracking block residency.
+        eviction_policy: Optional policy controlling the free block queue's
+            victim selection and insertion order.
     """
 
     def __init__(
@@ -151,6 +154,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        eviction_policy: FreeBlockEvictionPolicy | None = None,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -163,7 +167,7 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks, eviction_policy)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()

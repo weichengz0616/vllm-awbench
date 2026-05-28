@@ -18,10 +18,12 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.sched.offload_policy import KVTransferPlan
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
+    KVTransferPlan = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
@@ -237,6 +239,9 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # Logical scheduler-level KV load/offload plan.
+    offload_plan: KVTransferPlan | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

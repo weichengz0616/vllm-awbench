@@ -4,6 +4,7 @@
 
 import copy
 import os
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -153,6 +154,49 @@ class KVCacheBlock:
         )
 
 
+class FreeBlockEvictionPolicy(ABC):
+    """Policy for ordering free KV cache blocks for future eviction.
+
+    `FreeKVCacheBlockQueue` owns the linked-list mechanics; the policy owns
+    the eviction semantics: which block is selected next, and where newly
+    freed blocks are inserted.
+    """
+
+    def order_initial_blocks(
+        self, blocks: Sequence[KVCacheBlock]
+    ) -> Sequence[KVCacheBlock]:
+        """Return the initial queue order."""
+        return blocks
+
+    @abstractmethod
+    def select_victims(
+        self, queue: "FreeKVCacheBlockQueue", n: int
+    ) -> list[KVCacheBlock]:
+        """Remove and return the next `n` blocks to allocate/evict."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def insert_free_blocks(
+        self, queue: "FreeKVCacheBlockQueue", blocks: list[KVCacheBlock]
+    ) -> None:
+        """Insert newly freed blocks into the queue."""
+        raise NotImplementedError
+
+
+class LRUEvictionPolicy(FreeBlockEvictionPolicy):
+    """Default policy: evict the least-recently freed/accessed block first."""
+
+    def select_victims(
+        self, queue: "FreeKVCacheBlockQueue", n: int
+    ) -> list[KVCacheBlock]:
+        return queue._popleft_n(n)
+
+    def insert_free_blocks(
+        self, queue: "FreeKVCacheBlockQueue", blocks: list[KVCacheBlock]
+    ) -> None:
+        queue._append_tail_n(blocks)
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -173,9 +217,17 @@ class FreeKVCacheBlockQueue:
 
     Args:
         blocks: A list of KVCacheBlock objects.
+        eviction_policy: Policy controlling victim selection and insertion
+            order. Defaults to LRU.
     """
 
-    def __init__(self, blocks: list[KVCacheBlock]) -> None:
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        eviction_policy: FreeBlockEvictionPolicy | None = None,
+    ) -> None:
+        self.eviction_policy = eviction_policy or LRUEvictionPolicy()
+        blocks = list(self.eviction_policy.order_initial_blocks(blocks))
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -211,6 +263,12 @@ class FreeKVCacheBlockQueue:
         Returns:
             The first free block.
         """
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        return self.eviction_policy.select_victims(self, 1)[0]
+
+    def _popleft(self) -> KVCacheBlock:
+        """Remove the physical head of the linked list."""
         if (
             self.fake_free_list_head.next_free_block is self.fake_free_list_tail
             or self.fake_free_list_head.next_free_block is None
@@ -251,6 +309,13 @@ class FreeKVCacheBlockQueue:
         Returns:
             A list of n free blocks.
         """
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        return self.eviction_policy.select_victims(self, n)
+
+    def _popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """Remove the first n blocks from the physical linked-list head."""
         if n == 0:
             return []
         assert self.num_free_blocks >= n
@@ -302,21 +367,7 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to append.
         """
-        if self.fake_free_list_tail.prev_free_block is None:
-            raise RuntimeError(
-                "prev_free_block of fake_free_list_tail should always exist"
-            )
-        last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
-
-        # Connect the new block after the last block.
-        last_block.next_free_block = block
-        block.prev_free_block = last_block
-
-        # Connect the fake tail after the new block.
-        block.next_free_block = self.fake_free_list_tail
-        self.fake_free_list_tail.prev_free_block = block
-
-        self.num_free_blocks += 1
+        self.eviction_policy.insert_free_blocks(self, [block])
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -324,9 +375,12 @@ class FreeKVCacheBlockQueue:
         Args:
             blocks: The blocks to append.
         """
+        self.eviction_policy.insert_free_blocks(self, blocks)
+
+    def _append_tail_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Insert blocks at the physical linked-list tail."""
         if len(blocks) == 0:
             return
-
         last_block = self.fake_free_list_tail.prev_free_block
         assert last_block is not None, (
             "prev_free_block of fake_free_list_tail should always exist"
