@@ -59,6 +59,8 @@ from vllm.config import (
     get_attr_docs,
 )
 from vllm.config.cache import (
+    AgentKVEvictionPolicy,
+    AgentKVOffloadPolicy,
     BlockSize,
     CacheDType,
     KVOffloadingBackend,
@@ -585,6 +587,13 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    agent_kv_eviction_policy: AgentKVEvictionPolicy = (
+        CacheConfig.agent_kv_eviction_policy
+    )
+    agent_kv_offload_policy: AgentKVOffloadPolicy = (
+        CacheConfig.agent_kv_offload_policy
+    )
+    tokencake_reserved_ratio: float = CacheConfig.tokencake_reserved_ratio
     tokens_only: bool = False
 
     weight_transfer_config: WeightTransferConfig | None = get_field(
@@ -967,6 +976,18 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--agent-kv-eviction-policy",
+            **cache_kwargs["agent_kv_eviction_policy"],
+        )
+        cache_group.add_argument(
+            "--agent-kv-offload-policy",
+            **cache_kwargs["agent_kv_offload_policy"],
+        )
+        cache_group.add_argument(
+            "--tokencake-reserved-ratio",
+            **cache_kwargs["tokencake_reserved_ratio"],
         )
 
         # Multimodal related configs
@@ -1450,6 +1471,9 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            agent_kv_eviction_policy=self.agent_kv_eviction_policy,
+            agent_kv_offload_policy=self.agent_kv_offload_policy,
+            tokencake_reserved_ratio=self.tokencake_reserved_ratio,
         )
 
         ray_runtime_env = None

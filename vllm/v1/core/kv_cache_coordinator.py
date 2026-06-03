@@ -6,6 +6,7 @@ from math import lcm
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_policy import AgentKVEvictionPolicy
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashList,
@@ -41,6 +42,8 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+        tokencake_reserved_ratio: float = 0.0,
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -52,6 +55,8 @@ class KVCacheCoordinator(ABC):
             hash_block_size,
             enable_kv_cache_events,
             metrics_collector,
+            eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
@@ -266,6 +271,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+        tokencake_reserved_ratio: float = 0.0,
     ):
         super().__init__(
             kv_cache_config,
@@ -277,6 +284,8 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
         self.num_single_type_manager = len(self.single_type_managers)
 
@@ -312,6 +321,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+        tokencake_reserved_ratio: float = 0.0,
     ):
         super().__init__(
             kv_cache_config,
@@ -323,6 +334,8 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -377,6 +390,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+        tokencake_reserved_ratio: float = 0.0,
     ):
         super().__init__(
             kv_cache_config,
@@ -388,6 +403,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -549,6 +566,8 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+    tokencake_reserved_ratio: float = 0.0,
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -560,6 +579,8 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
@@ -572,6 +593,8 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,
@@ -583,4 +606,6 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        agent_eviction_policy=agent_eviction_policy,
+        tokencake_reserved_ratio=tokencake_reserved_ratio,
     )

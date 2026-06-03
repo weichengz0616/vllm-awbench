@@ -1,0 +1,542 @@
+# SPDX-License-Identifier: Apache-2.0
+
+from types import SimpleNamespace
+
+import pytest
+
+from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
+from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+from vllm.v1.core.sched.offload_policy import (
+    DefaultOffloadPolicy,
+    LoadCandidateContext,
+    KVFlowOffloadPolicy,
+    LoadDecisionContext,
+    LoadRequestInfo,
+    OffloadDecisionContext,
+    OffloadPolicyState,
+    TokencakeOffloadPolicy,
+)
+
+
+def test_block_pool_requires_string_eviction_policy():
+    with pytest.raises(TypeError, match="must be an AgentKVEvictionPolicy string"):
+        BlockPool(
+            num_gpu_blocks=4,
+            enable_caching=False,
+            hash_block_size=16,
+            eviction_policy=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_block_pool_rejects_unknown_eviction_policy():
+    with pytest.raises(ValueError, match="Unknown eviction_policy"):
+        BlockPool(
+            num_gpu_blocks=4,
+            enable_caching=False,
+            hash_block_size=16,
+            eviction_policy="unknown",  # type: ignore[arg-type]
+        )
+
+
+class DummyRequest:
+    def __init__(
+        self,
+        metadata: KVRequestPolicyMetadata,
+        request_id: str = "r0",
+        num_computed_tokens: int = 0,
+        num_tokens: int | None = None,
+        block_hashes: list[bytes] | None = None,
+    ):
+        self.kv_cache_policy_metadata = metadata
+        self.request_id = request_id
+        self.num_computed_tokens = num_computed_tokens
+        self.block_hashes = block_hashes or []
+        self.num_tokens = num_tokens if num_tokens is not None else (
+            len(self.block_hashes) * 2
+        )
+
+
+class DummyKVCacheManager:
+    def __init__(
+        self,
+        block_ids: dict[str, list[int]],
+        fixed_hashes: dict[tuple[str, str], list[bytes]] | None = None,
+    ):
+        self.block_ids = block_ids
+        self.fixed_hashes = fixed_hashes or {}
+
+    def get_block_ids(self, request_id: str):
+        return (self.block_ids[request_id],)
+
+    def get_agent_fixed_block_hashes(self, program_id: str, agent_id: str):
+        return self.fixed_hashes.get((program_id, agent_id), [])
+
+
+class DummyBlocks:
+    def __init__(self, block_ids: list[int], computed_blocks: int = 0):
+        self._block_ids = block_ids
+        self.blocks = (
+            [
+                SimpleNamespace(
+                    block_hash=(b"cached" if idx < computed_blocks else None)
+                )
+                for idx, _ in enumerate(block_ids)
+            ],
+        )
+
+    def get_block_ids(self):
+        return (self._block_ids,)
+
+
+def test_cachettl_eviction_prefers_expired_ttl_blocks():
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=False,
+        hash_block_size=16,
+        eviction_policy="cachettl",
+    )
+    # Set deadlines around the real monotonic value.
+    real_now = pool._make_eviction_context().now
+    pool.block_metadata[1].ttl_deadline = real_now + 10
+    pool.block_metadata[2].ttl_deadline = real_now - 1
+
+    victim = pool.free_block_queue.popleft()
+
+    assert victim.block_id == 2
+
+
+def test_kvflow_eviction_prefers_dynamic_then_larger_step_distance():
+    pool = BlockPool(
+        num_gpu_blocks=5,
+        enable_caching=False,
+        hash_block_size=16,
+        eviction_policy="kvflow",
+    )
+    pool.block_metadata[1].prompt_part = "fixed"
+    pool.block_metadata[1].steps_to_execution = 1
+    pool.block_metadata[2].prompt_part = "fixed"
+    pool.block_metadata[2].steps_to_execution = 5
+    pool.block_metadata[3].prompt_part = "dynamic"
+
+    first = pool.free_block_queue.popleft()
+    second = pool.free_block_queue.popleft()
+
+    assert first.block_id == 3
+    assert second.block_id == 2
+
+
+def test_request_policy_metadata_binds_to_blocks():
+    request = DummyRequest(
+        KVRequestPolicyMetadata.from_extra_args(
+            {
+                "kv_cache_policy": {
+                    "workflow_id": "wf0",
+                    "program_id": "p0",
+                    "agent_id": "a0",
+                    "fixed_prefix_len": 2,
+                    "steps_to_execution": 3,
+                    "critical": True,
+                }
+            }
+        )
+    )
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=False, hash_block_size=2)
+    block = pool.free_block_queue.popleft()
+
+    pool.bind_block_metadata(block, request, block_index=0, block_size=2)
+    metadata = pool.get_block_metadata(block)
+
+    assert metadata.program_id == "p0"
+    assert metadata.workflow_id == "wf0"
+    assert metadata.agent_id == "a0"
+    assert metadata.prompt_part == "fixed"
+    assert metadata.steps_to_execution == 3
+    assert metadata.critical is True
+
+
+def test_request_policy_metadata_parses_workflow_id():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "kv_cache_policy": {
+                "workflow_id": "workflow-template",
+                "program_id": "program-instance",
+                "agent_id": "agent-a",
+                "fixed_prefix_len": 4,
+            }
+        }
+    )
+
+    assert metadata.workflow_id == "workflow-template"
+    assert metadata.program_id == "program-instance"
+    assert metadata.agent_id == "agent-a"
+    assert metadata.workflow_key == "workflow-template"
+
+
+def test_agent_fixed_hashes_are_keyed_by_workflow_agent():
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.hash_block_size = 2
+    manager._agent_fixed_block_hashes = {}
+
+    request = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="a0",
+            fixed_prefix_len=4,
+        ),
+        block_hashes=[b"h0", b"h1", b"dynamic"],
+    )
+
+    manager._record_agent_fixed_block_hashes(request)
+
+    assert manager.get_agent_fixed_block_hashes("wf0", "a0") == [b"h0", b"h1"]
+    assert manager.get_agent_fixed_block_hashes("p0", "a0") == []
+
+
+def test_agent_live_blocks_survive_free_and_are_removed_on_eviction():
+    pool = BlockPool(num_gpu_blocks=3, enable_caching=True, hash_block_size=2)
+    request = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="a0",
+            fixed_prefix_len=2,
+        ),
+        block_hashes=[b"h0"],
+    )
+    block = pool.get_new_blocks(1)[0]
+    pool.bind_block_metadata(block, request, block_index=0, block_size=2)
+
+    pool.cache_full_blocks(
+        request=request,
+        blocks=[block],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=2,
+        kv_cache_group_id=0,
+    )
+    block_hash = make_block_hash_with_group_id(b"h0", 0)
+
+    assert pool.get_agent_live_blocks("wf0", "a0")[block_hash] == [block]
+
+    pool.free_blocks([block])
+    assert pool.get_agent_live_blocks("wf0", "a0")[block_hash] == [block]
+
+    evicted_block = pool.get_new_blocks(1)[0]
+
+    assert evicted_block is block
+    assert pool.get_agent_live_blocks("wf0", "a0") == {}
+
+
+def test_kvflow_offload_policy_stores_fixed_prefix_only():
+    policy = KVFlowOffloadPolicy()
+    req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            agent_id="a0",
+            fixed_prefix_len=4,
+            steps_to_execution=1,
+        ),
+        request_id="r0",
+        num_computed_tokens=0,
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="r0", block_ids=([1, 2, 3],))],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={"r0": 6},
+    )
+    context = OffloadDecisionContext(
+        scheduler_output=scheduler_output,
+        requests={"r0": req},
+        offload_state=OffloadPolicyState(
+            gpu_block_size=2,
+            offloaded_block_size=2,
+            block_size_factor=1,
+        ),
+        kv_cache_manager=DummyKVCacheManager({"r0": [1, 2, 3]}),
+        running=[],
+        waiting=[],
+        preempted_req_ids=set(),
+    )
+
+    plan = policy.get_offload_plan(context)
+
+    assert len(plan.block_ranges) == 1
+    assert plan.block_ranges[0].num_blocks == 2
+    assert plan.block_ranges[0].block_hashes == [b"h0", b"h1"]
+    assert plan.block_ranges[0].gpu_block_ids == [1, 2]
+
+
+def test_default_offload_policy_rejects_loads_already_being_loaded():
+    policy = DefaultOffloadPolicy()
+    state = OffloadPolicyState(
+        gpu_block_size=2,
+        offloaded_block_size=2,
+        block_size_factor=1,
+    )
+    req = DummyRequest(
+        KVRequestPolicyMetadata(),
+        request_id="r0",
+        block_hashes=[b"h0", b"h1"],
+    )
+
+    allowed = policy.should_schedule_load_candidate(
+        LoadCandidateContext(
+            request=req,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2,
+            load_kv_async=True,
+            offload_state=state,
+            blocks_being_loaded={b"h0"},
+        )
+    )
+
+    assert allowed is False
+
+
+def test_default_offload_policy_tracks_step_local_planned_loads():
+    policy = DefaultOffloadPolicy()
+    state = OffloadPolicyState(
+        gpu_block_size=2,
+        offloaded_block_size=2,
+        block_size_factor=1,
+    )
+    first_req = DummyRequest(
+        KVRequestPolicyMetadata(),
+        request_id="r0",
+        block_hashes=[b"h0", b"h1"],
+    )
+    second_req = DummyRequest(
+        KVRequestPolicyMetadata(),
+        request_id="r1",
+        block_hashes=[b"h0", b"h2"],
+    )
+    assert policy.should_schedule_load_candidate(
+        LoadCandidateContext(
+            request=first_req,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2,
+            load_kv_async=True,
+            offload_state=state,
+            blocks_being_loaded=set(),
+        )
+    )
+    policy.record_scheduled_load(
+        LoadRequestInfo(
+            request=first_req,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2,
+            load_kv_async=True,
+            allocated_blocks=DummyBlocks([11, 12]),
+        )
+    )
+
+    allowed = policy.should_schedule_load_candidate(
+        LoadCandidateContext(
+            request=second_req,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2,
+            load_kv_async=True,
+            offload_state=state,
+            blocks_being_loaded=set(),
+        )
+    )
+    plan = policy.get_load_plan(
+        LoadDecisionContext(
+            request_infos=[],
+            offload_state=state,
+            kv_cache_manager=DummyKVCacheManager({}),
+            token_budget=0,
+            max_num_running_reqs=1,
+            num_running_reqs=1,
+        )
+    )
+
+    assert allowed is False
+    assert len(plan.block_ranges) == 1
+    assert plan.block_ranges[0].req_id == "r0"
+    assert plan.block_ranges[0].block_hashes == [b"h0"]
+    assert plan.block_ranges[0].gpu_block_ids == [11]
+
+
+def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
+    policy = KVFlowOffloadPolicy()
+    current_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            agent_id="agent_a",
+            next_agent_ids=["agent_b"],
+        ),
+        request_id="current",
+    )
+    next_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            agent_id="agent_b",
+            fixed_prefix_len=4,
+        ),
+        request_id="next",
+        block_hashes=[b"unused0", b"unused1", b"unused2"],
+    )
+    context = LoadDecisionContext(
+        request_infos=[
+            LoadRequestInfo(
+                request=next_req,
+                num_local_computed_tokens=0,
+                num_external_computed_tokens=4,
+                load_kv_async=True,
+                allocated_blocks=DummyBlocks([11, 12, 13]),
+            )
+        ],
+        offload_state=OffloadPolicyState(
+            gpu_block_size=2,
+            offloaded_block_size=2,
+            block_size_factor=1,
+        ),
+        kv_cache_manager=DummyKVCacheManager(
+            {},
+            fixed_hashes={("p0", "agent_b"): [b"fixed0", b"fixed1"]},
+        ),
+        token_budget=0,
+        max_num_running_reqs=1,
+        num_running_reqs=1,
+        scheduled_requests=[current_req],
+    )
+
+    plan = policy.get_load_plan(context)
+
+    assert len(plan.block_ranges) == 1
+    assert plan.block_ranges[0].req_id == "next"
+    assert plan.block_ranges[0].block_hashes == [b"fixed0", b"fixed1"]
+    assert plan.block_ranges[0].gpu_block_ids == [11, 12]
+
+
+def test_tokencake_offload_policy_offloads_call_start_stall():
+    policy = TokencakeOffloadPolicy()
+    req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            program_type="react",
+            agent_id="a0",
+            session_id="s0",
+            call_name="search",
+            call_duration=10.0,
+            function_event="call_start",
+        ),
+        request_id="r0",
+        num_computed_tokens=4,
+        block_hashes=[b"h0", b"h1"],
+    )
+    scheduler_output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[], new_block_ids=[], resumed_req_ids=set()
+        ),
+        num_scheduled_tokens={},
+    )
+    context = OffloadDecisionContext(
+        scheduler_output=scheduler_output,
+        requests={"r0": req},
+        offload_state=OffloadPolicyState(
+            gpu_block_size=2,
+            offloaded_block_size=2,
+            block_size_factor=1,
+        ),
+        kv_cache_manager=DummyKVCacheManager({"r0": [4, 5]}),
+        running=[req],
+        waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
+        preempted_req_ids=set(),
+    )
+
+    plan = policy.get_offload_plan(context)
+
+    assert len(plan.block_ranges) == 1
+    assert plan.block_ranges[0].num_blocks == 2
+    assert plan.block_ranges[0].block_hashes == [b"h0", b"h1"]
+    assert plan.block_ranges[0].gpu_block_ids == [4, 5]
+
+
+def test_tokencake_load_policy_prefetches_same_react_session_hashes():
+    policy = TokencakeOffloadPolicy()
+    start_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            program_type="react",
+            agent_id="a0",
+            session_id="s0",
+            call_name="search",
+            call_duration=10.0,
+            function_event="call_start",
+        ),
+        request_id="r0",
+        num_computed_tokens=4,
+        block_hashes=[b"h0", b"h1"],
+    )
+    policy.get_offload_plan(
+        OffloadDecisionContext(
+            scheduler_output=SimpleNamespace(
+                scheduled_new_reqs=[],
+                scheduled_cached_reqs=SimpleNamespace(
+                    req_ids=[], new_block_ids=[], resumed_req_ids=set()
+                ),
+                num_scheduled_tokens={},
+            ),
+            requests={"r0": start_req},
+            offload_state=OffloadPolicyState(
+                gpu_block_size=2,
+                offloaded_block_size=2,
+                block_size_factor=1,
+            ),
+            kv_cache_manager=DummyKVCacheManager({"r0": [4, 5]}),
+            running=[start_req],
+            waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
+            preempted_req_ids=set(),
+            now=0.0,
+        )
+    )
+    finish_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            program_type="react",
+            agent_id="a0",
+            session_id="s0",
+            call_name="search",
+            function_event="call_finish",
+        ),
+        request_id="r1",
+        block_hashes=[b"h0", b"h1", b"h2"],
+    )
+
+    plan = policy.get_load_plan(
+        LoadDecisionContext(
+            request_infos=[
+                LoadRequestInfo(
+                    request=finish_req,
+                    num_local_computed_tokens=0,
+                    num_external_computed_tokens=0,
+                    load_kv_async=True,
+                    allocated_blocks=DummyBlocks([11, 12, 13]),
+                )
+            ],
+            offload_state=OffloadPolicyState(
+                gpu_block_size=2,
+                offloaded_block_size=2,
+                block_size_factor=1,
+            ),
+            kv_cache_manager=DummyKVCacheManager({}),
+            token_budget=0,
+            max_num_running_reqs=1,
+            num_running_reqs=1,
+            now=1.0,
+        )
+    )
+
+    assert len(plan.block_ranges) == 1
+    assert plan.block_ranges[0].req_id == "r1"
+    assert plan.block_ranges[0].block_hashes == [b"h0", b"h1", b"h2"]
+    assert plan.block_ranges[0].gpu_block_ids == [11, 12, 13]

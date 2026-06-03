@@ -10,7 +10,16 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_policy import (
+    AgentKVEvictionPolicy,
+    monotonic_time,
+    ttl_deadline,
+)
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    BlockHashWithGroupId,
+    KVCacheBlock,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -104,8 +113,11 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: AgentKVEvictionPolicy = "lru",
+        tokencake_reserved_ratio: float = 0.0,
     ) -> None:
         self.max_model_len = max_model_len
+        self.hash_block_size = hash_block_size
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
@@ -126,6 +138,8 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
+            tokencake_reserved_ratio=tokencake_reserved_ratio,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -138,6 +152,16 @@ class KVCacheManager:
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
+        )
+        self._agent_fixed_block_hashes: dict[tuple[str, str], list[BlockHash]] = {}
+        logger.info(
+            "awbench ---- Initialized KV cache manager with agent eviction policy=%s, "
+            "tokencake_reserved_ratio=%.4f, hash_block_size=%d, "
+            "num_kv_cache_groups=%d",
+            agent_eviction_policy,
+            tokencake_reserved_ratio,
+            hash_block_size,
+            self.num_kv_cache_groups,
         )
 
     @property
@@ -356,6 +380,9 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        # q1: 如何在 block 上绑定 metadata
+        # 将请求的 metadata 绑定到分配的 new block 上
+        self._bind_request_metadata_to_new_blocks(request, new_blocks)
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
@@ -375,6 +402,90 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    def _bind_request_metadata_to_new_blocks(
+        self,
+        request: Request,
+        new_blocks: tuple[list[KVCacheBlock], ...],
+    ) -> None:
+        bound_blocks = 0
+        for group_blocks, new_group_blocks, manager in zip(
+            self.coordinator.get_blocks(request.request_id),
+            new_blocks,
+            self.coordinator.single_type_managers,
+        ):
+            block_size = manager.block_size
+            first_new_block_index = len(group_blocks) - len(new_group_blocks)
+            for offset, block in enumerate(new_group_blocks):
+                if not block.is_null:
+                    self.block_pool.bind_block_metadata(
+                        block=block,
+                        request=request,
+                        block_index=first_new_block_index + offset,
+                        block_size=block_size,
+                    )
+                    bound_blocks += 1
+        # q2: 维护每个 workflow 上每个 agent 的 fixed block hash
+        # 此时的 request 已经计算出 hash 了吗？
+        self._record_agent_fixed_block_hashes(request)
+        if bound_blocks:
+            metadata = request.kv_cache_policy_metadata
+            logger.info(
+                "awbench ---- Bound KV metadata to %d new blocks for request_id=%s "
+                "workflow_id=%s program_id=%s agent_id=%s fixed_prefix_len=%s",
+                bound_blocks,
+                request.request_id,
+                metadata.workflow_key,
+                metadata.program_id,
+                metadata.agent_id,
+                metadata.fixed_prefix_len,
+            )
+
+    def _record_agent_fixed_block_hashes(self, request: Request) -> None:
+        metadata = request.kv_cache_policy_metadata
+        workflow_id = metadata.workflow_key
+        if (
+            workflow_id is None
+            or metadata.agent_id is None
+            or metadata.fixed_prefix_len is None
+            or metadata.fixed_prefix_len <= 0
+        ):
+            return
+
+        num_fixed_blocks = min(
+            metadata.fixed_prefix_len // self.hash_block_size,
+            len(request.block_hashes),
+        )
+        if num_fixed_blocks <= 0:
+            return
+
+        key = (workflow_id, metadata.agent_id)
+        block_hashes = list(request.block_hashes[:num_fixed_blocks])
+        existing = self._agent_fixed_block_hashes.get(key)
+        if existing is None or len(block_hashes) > len(existing):
+            self._agent_fixed_block_hashes[key] = block_hashes
+            logger.info(
+                "awbench ---- Recorded fixed KV block hashes for agent: request_id=%s "
+                "workflow_id=%s agent_id=%s num_fixed_blocks=%d",
+                request.request_id,
+                workflow_id,
+                metadata.agent_id,
+                len(block_hashes),
+            )
+
+    def get_agent_fixed_block_hashes(
+        self,
+        workflow_id: str,
+        agent_id: str,
+    ) -> list[BlockHash]:
+        return list(self._agent_fixed_block_hashes.get((workflow_id, agent_id), ()))
+
+    def get_agent_live_blocks(
+        self,
+        workflow_id: str,
+        agent_id: str,
+    ) -> dict[BlockHashWithGroupId, list[KVCacheBlock]]:
+        return self.block_pool.get_agent_live_blocks(workflow_id, agent_id)
+
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -384,6 +495,35 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
+
+    def maybe_pin_blocks_for_ttl(self, request: Request) -> bool:
+        deadline = ttl_deadline(monotonic_time(), request.kv_cache_policy_metadata)
+        if deadline is None:
+            return False
+        num_blocks = 0
+        for blocks in self.coordinator.get_blocks(request.request_id):
+            self.block_pool.set_ttl_deadline_for_blocks(blocks, deadline)
+            num_blocks += sum(not block.is_null for block in blocks)
+        metadata = request.kv_cache_policy_metadata
+        logger.info(
+            "awbench ---- Pinned request KV blocks for TTL: request_id=%s workflow_id=%s "
+            "program_id=%s agent_id=%s ttl_seconds=%s ttl_deadline=%.6f "
+            "num_blocks=%d",
+            request.request_id,
+            metadata.workflow_key,
+            metadata.program_id,
+            metadata.agent_id,
+            metadata.ttl_seconds,
+            deadline,
+            num_blocks,
+        )
+        return True
+
+    def clear_expired_ttls(self, protected_program_ids: set[str]) -> None:
+        self.block_pool.clear_expired_ttls(monotonic_time(), protected_program_ids)
+
+    def force_clear_one_ttl(self) -> bool:
+        return self.block_pool.force_clear_one_ttl()
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

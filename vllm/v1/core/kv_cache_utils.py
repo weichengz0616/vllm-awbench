@@ -300,6 +300,8 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks -= 1
         return first_block
 
+    # q4: 如何在 free block 中取出 n 个 block
+    # 这里直接选择 victim
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop the first n free blocks and reduce num_free_blocks by n.
 

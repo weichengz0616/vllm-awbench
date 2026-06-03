@@ -33,6 +33,8 @@ MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
+AgentKVEvictionPolicy = Literal["lru", "cachettl", "kvflow", "tokencake"]
+AgentKVOffloadPolicy = Literal["default", "kvflow", "tokencake"]
 
 
 @config
@@ -168,6 +170,15 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    agent_kv_eviction_policy: AgentKVEvictionPolicy = "lru"
+    """Agent-aware KV eviction policy. Defaults to the existing LRU behavior."""
+
+    agent_kv_offload_policy: AgentKVOffloadPolicy = "default"
+    """Agent-aware KV offload policy. Defaults to existing offload behavior."""
+
+    tokencake_reserved_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Fraction of GPU KV blocks reserved for critical Tokencake requests."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -195,6 +206,9 @@ class CacheConfig:
             "num_cpu_blocks",
             # WIP feature toggle not impacting compiled graph shape
             "kv_sharing_fast_prefill",
+            "agent_kv_eviction_policy",
+            "agent_kv_offload_policy",
+            "tokencake_reserved_ratio",
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
