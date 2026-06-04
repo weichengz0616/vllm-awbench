@@ -155,6 +155,11 @@ class Request:
         # The number of tokens with prefix cache hits.
         self.num_cached_tokens = -1
 
+        # True once the active KV cache policy has consumed this request's
+        # metadata. Used to avoid reapplying the same metadata after preemption
+        # or across decode scheduling iterations.
+        self.kv_cache_policy_metadata_applied = False
+
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 

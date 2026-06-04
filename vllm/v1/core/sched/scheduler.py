@@ -640,6 +640,13 @@ class Scheduler(SchedulerInterface):
                     skipped_waiting_requests.prepend_request(request)
                     continue
 
+                if (
+                    request.status == RequestStatus.WAITING
+                    and not request.kv_cache_policy_metadata_applied
+                ):
+                    self.kv_cache_manager.on_request_metadata(request)
+                    request.kv_cache_policy_metadata_applied = True
+
                 num_external_computed_tokens = 0
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0

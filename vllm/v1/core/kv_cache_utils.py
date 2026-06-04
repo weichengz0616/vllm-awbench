@@ -168,6 +168,18 @@ class FreeBlockEvictionPolicy(ABC):
         """Return the initial queue order."""
         return blocks
 
+    def on_request_metadata(self, context: Any) -> None:
+        """Update block metadata from a request.
+
+        Most policies do not need request-driven metadata updates. Policies
+        that do, such as KVFlow, can override this hook.
+        """
+        return
+
+    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
+        """Update metadata after a newly allocated block is bound to a request."""
+        return
+
     @abstractmethod
     def select_victims(
         self, queue: "FreeKVCacheBlockQueue", n: int

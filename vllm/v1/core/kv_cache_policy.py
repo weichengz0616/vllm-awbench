@@ -5,15 +5,20 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, TYPE_CHECKING
 
-from vllm.v1.core.kv_cache_utils import FreeBlockEvictionPolicy, KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHashWithGroupId,
+    FreeBlockEvictionPolicy,
+    KVCacheBlock,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
 
-PromptPart = Literal["fixed", "dynamic", "unknown"]
+PromptPart = Literal["fixed", "dynamic", "output"]
 KVBlockStatus = Literal["gpu", "cpu", "loading", "offloading", "reserved"]
 KVPoolClass = Literal["shared", "reserved"]
 AgentKVEvictionPolicy = Literal["lru", "cachettl", "kvflow", "tokencake"]
@@ -25,7 +30,8 @@ class KVBlockPolicyMetadata:
     workflow_id: str | None = None
     program_id: str | None = None
     agent_id: str | None = None
-    prompt_part: PromptPart = "unknown"
+    prompt_part: PromptPart = "output"
+    step_contributions: dict[tuple[str, str], float] = field(default_factory=dict)
     steps_to_execution: float | None = None
     ttl_deadline: float | None = None
     critical: bool = False
@@ -36,7 +42,8 @@ class KVBlockPolicyMetadata:
         self.workflow_id = None
         self.program_id = None
         self.agent_id = None
-        self.prompt_part = "unknown"
+        self.prompt_part = "output"
+        self.step_contributions.clear()
         self.steps_to_execution = None
         self.ttl_deadline = None
         self.critical = False
@@ -145,6 +152,17 @@ class EvictionContext:
     request_metadata: KVRequestPolicyMetadata | None = None
 
 
+@dataclass
+class RequestMetadataContext:
+    request: "Request"
+    metadata_for_block: Callable[[KVCacheBlock], KVBlockPolicyMetadata]
+    get_agent_live_blocks: Callable[
+        [str, str],
+        dict[BlockHashWithGroupId, list[KVCacheBlock]],
+    ]
+    iter_block_metadata: Callable[[], Iterable[KVBlockPolicyMetadata]]
+
+
 class EvictionContextProvider(Protocol):
     def __call__(self) -> EvictionContext: ...
 
@@ -171,6 +189,16 @@ class BaseEvictionPolicy(FreeBlockEvictionPolicy):
 
     def __init__(self, context_provider: EvictionContextProvider):
         self.context_provider = context_provider
+
+    def on_request_metadata(self, context: RequestMetadataContext) -> None:
+        return
+
+    def on_block_metadata_bound(
+        self,
+        context: RequestMetadataContext,
+        block: KVCacheBlock,
+    ) -> None:
+        return
 
     def insert_free_blocks(self, queue, blocks: list[KVCacheBlock]) -> None:
         queue._append_tail_n(blocks)
@@ -217,6 +245,87 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
 
     policy_name: AgentKVEvictionPolicy = "kvflow"
 
+    @staticmethod
+    def _set_step_contribution(
+        metadata: KVBlockPolicyMetadata,
+        program_id: str,
+        agent_id: str,
+        step: float,
+    ) -> None:
+        metadata.step_contributions[(program_id, agent_id)] = step
+        KVFlowEvictionPolicy._refresh_steps_to_execution(metadata)
+
+    @staticmethod
+    def _remove_program_contributions(
+        metadata: KVBlockPolicyMetadata,
+        program_id: str,
+    ) -> None:
+        for key in list(metadata.step_contributions):
+            if key[0] == program_id:
+                del metadata.step_contributions[key]
+        KVFlowEvictionPolicy._refresh_steps_to_execution(metadata)
+
+    @staticmethod
+    def _refresh_steps_to_execution(metadata: KVBlockPolicyMetadata) -> None:
+        metadata.steps_to_execution = (
+            min(metadata.step_contributions.values())
+            if metadata.step_contributions
+            else None
+        )
+
+    def on_block_metadata_bound(
+        self,
+        context: RequestMetadataContext,
+        block: KVCacheBlock,
+    ) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        metadata = context.metadata_for_block(block)
+        step = req_metadata.step_for_agent(req_metadata.agent_id)
+        if (
+            metadata.prompt_part == "fixed"
+            and req_metadata.program_id is not None
+            and req_metadata.agent_id is not None
+            and step is not None
+        ):
+            self._set_step_contribution(
+                metadata,
+                req_metadata.program_id,
+                req_metadata.agent_id,
+                step,
+            )
+
+    def on_request_metadata(self, context: RequestMetadataContext) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        workflow_id = req_metadata.workflow_key
+        program_id = req_metadata.program_id
+        if workflow_id is None or program_id is None:
+            return
+
+        if req_metadata.is_program_last_step:
+            for metadata in context.iter_block_metadata():
+                if metadata.workflow_id == workflow_id:
+                    self._remove_program_contributions(metadata, program_id)
+            return
+
+        agent_steps = req_metadata.agent_steps_to_execution
+        if (
+            not agent_steps
+            and req_metadata.agent_id is not None
+            and req_metadata.steps_to_execution is not None
+        ):
+            agent_steps = {req_metadata.agent_id: req_metadata.steps_to_execution}
+
+        for agent_id, step in agent_steps.items():
+            blocks_by_hash = context.get_agent_live_blocks(workflow_id, agent_id)
+            for blocks in blocks_by_hash.values():
+                for block in blocks:
+                    self._set_step_contribution(
+                        context.metadata_for_block(block),
+                        program_id,
+                        agent_id,
+                        step,
+                    )
+
     def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
         ctx = self.context_provider()
 
@@ -224,7 +333,7 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
             meta = ctx.metadata_for_block(block)
             if meta.status in ("loading", "offloading", "reserved"):
                 return (4, 0, lru_index)
-            if meta.prompt_part == "dynamic":
+            if meta.prompt_part in ("dynamic", "output"):
                 return (0, 0, lru_index)
             if meta.prompt_part == "fixed" and meta.steps_to_execution is not None:
                 return (1, -meta.steps_to_execution, lru_index)
@@ -258,14 +367,19 @@ def get_prompt_part(
     block_index: int,
     block_size: int,
     fixed_prefix_len: int | None,
+    num_prompt_tokens: int,
 ) -> PromptPart:
     aligned_fixed_prefix_len = align_fixed_prefix_len(
         fixed_prefix_len, block_size
     )
     if aligned_fixed_prefix_len is None:
-        return "unknown"
+        aligned_fixed_prefix_len = 0
     block_start = block_index * block_size
-    return "fixed" if block_start < aligned_fixed_prefix_len else "dynamic"
+    if block_start < aligned_fixed_prefix_len:
+        return "fixed"
+    if block_start < num_prompt_tokens:
+        return "dynamic"
+    return "output"
 
 
 def align_fixed_prefix_len(

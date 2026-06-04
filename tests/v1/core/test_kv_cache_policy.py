@@ -47,6 +47,7 @@ class DummyRequest:
         request_id: str = "r0",
         num_computed_tokens: int = 0,
         num_tokens: int | None = None,
+        num_prompt_tokens: int | None = None,
         block_hashes: list[bytes] | None = None,
     ):
         self.kv_cache_policy_metadata = metadata
@@ -55,6 +56,11 @@ class DummyRequest:
         self.block_hashes = block_hashes or []
         self.num_tokens = num_tokens if num_tokens is not None else (
             len(self.block_hashes) * 2
+        )
+        self.num_prompt_tokens = (
+            num_prompt_tokens
+            if num_prompt_tokens is not None
+            else self.num_tokens
         )
 
 
@@ -119,6 +125,8 @@ def test_kvflow_eviction_prefers_dynamic_then_larger_step_distance():
     pool.block_metadata[2].prompt_part = "fixed"
     pool.block_metadata[2].steps_to_execution = 5
     pool.block_metadata[3].prompt_part = "dynamic"
+    pool.block_metadata[4].prompt_part = "fixed"
+    pool.block_metadata[4].steps_to_execution = 0
 
     first = pool.free_block_queue.popleft()
     second = pool.free_block_queue.popleft()
@@ -131,7 +139,7 @@ def test_request_policy_metadata_binds_to_blocks():
     request = DummyRequest(
         KVRequestPolicyMetadata.from_extra_args(
             {
-                "kv_cache_policy": {
+                "awbench_meta": {
                     "workflow_id": "wf0",
                     "program_id": "p0",
                     "agent_id": "a0",
@@ -159,7 +167,7 @@ def test_request_policy_metadata_binds_to_blocks():
 def test_request_policy_metadata_parses_workflow_id():
     metadata = KVRequestPolicyMetadata.from_extra_args(
         {
-            "kv_cache_policy": {
+            "awbench_meta": {
                 "workflow_id": "workflow-template",
                 "program_id": "program-instance",
                 "agent_id": "agent-a",
@@ -248,6 +256,70 @@ def test_agent_live_blocks_survive_free_and_are_removed_on_eviction():
 
     assert evicted_block is block
     assert pool.get_agent_live_blocks("wf0", "a0") == {}
+
+
+def test_kvflow_program_contributions_update_live_fixed_blocks():
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=2,
+        eviction_policy="kvflow",
+    )
+    request = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="a0",
+            fixed_prefix_len=2,
+        ),
+        block_hashes=[b"h0"],
+    )
+    block = pool.get_new_blocks(1)[0]
+    pool.bind_block_metadata(block, request, block_index=0, block_size=2)
+    pool.cache_full_blocks(
+        request=request,
+        blocks=[block],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=2,
+        kv_cache_group_id=0,
+    )
+
+    pool.on_request_metadata(
+        DummyRequest(
+            KVRequestPolicyMetadata(
+                workflow_id="wf0",
+                program_id="p0",
+                agent_steps_to_execution={"a0": 4},
+            )
+        )
+    )
+    pool.on_request_metadata(
+        DummyRequest(
+            KVRequestPolicyMetadata(
+                workflow_id="wf0",
+                program_id="p1",
+                agent_steps_to_execution={"a0": 1},
+            )
+        )
+    )
+
+    metadata = pool.get_block_metadata(block)
+    assert metadata.step_contributions == {("p0", "a0"): 4, ("p1", "a0"): 1}
+    assert metadata.steps_to_execution == 1
+
+    pool.on_request_metadata(
+        DummyRequest(
+            KVRequestPolicyMetadata(
+                workflow_id="wf0",
+                program_id="p1",
+                is_program_last_step=True,
+            )
+        )
+    )
+
+    assert metadata.step_contributions == {("p0", "a0"): 4}
+    assert metadata.steps_to_execution == 4
 
 
 def test_kvflow_offload_policy_stores_fixed_prefix_only():

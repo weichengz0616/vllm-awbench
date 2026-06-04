@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
     EvictionContext,
     KVBlockPolicyMetadata,
+    RequestMetadataContext,
     get_prompt_part,
     make_free_block_eviction_policy,
     monotonic_time,
@@ -238,6 +239,16 @@ class BlockPool:
     def get_block_metadata(self, block: KVCacheBlock) -> KVBlockPolicyMetadata:
         return self.block_metadata[block.block_id]
 
+    def on_request_metadata(self, request: Request) -> None:
+        self.free_block_queue.eviction_policy.on_request_metadata(
+            RequestMetadataContext(
+                request=request,
+                metadata_for_block=self.get_block_metadata,
+                get_agent_live_blocks=self.get_agent_live_blocks,
+                iter_block_metadata=lambda: iter(self.block_metadata),
+            )
+        )
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -409,27 +420,32 @@ class BlockPool:
         metadata.program_id = req_metadata.program_id
         metadata.agent_id = req_metadata.agent_id
         metadata.prompt_part = get_prompt_part(
-            block_index, block_size, req_metadata.fixed_prefix_len
+            block_index,
+            block_size,
+            req_metadata.fixed_prefix_len,
+            request.num_prompt_tokens,
         )
-        step = req_metadata.step_for_agent(req_metadata.agent_id)
-        if step is not None:
-            if metadata.steps_to_execution is None:
-                metadata.steps_to_execution = step
-            else:
-                metadata.steps_to_execution = min(metadata.steps_to_execution, step)
         metadata.critical = req_metadata.critical
         metadata.status = "gpu"
+        self.free_block_queue.eviction_policy.on_block_metadata_bound(
+            RequestMetadataContext(
+                request=request,
+                metadata_for_block=self.get_block_metadata,
+                get_agent_live_blocks=self.get_agent_live_blocks,
+                iter_block_metadata=lambda: iter(self.block_metadata),
+            ),
+            block,
+        )
         if (
             metadata.workflow_id is not None
             or metadata.program_id is not None
             or metadata.agent_id is not None
-            or metadata.prompt_part != "unknown"
             or metadata.critical
         ):
             logger.info(
                 "awbench ---- Bound KV block metadata: block_id=%d request_id=%s "
                 "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s "
-                "steps_to_execution=%s critical=%s pool_class=%s",
+                "steps_to_execution=%s contributions=%d critical=%s pool_class=%s",
                 block.block_id,
                 request.request_id,
                 metadata.workflow_id,
@@ -437,6 +453,7 @@ class BlockPool:
                 metadata.agent_id,
                 metadata.prompt_part,
                 metadata.steps_to_execution,
+                len(metadata.step_contributions),
                 metadata.critical,
                 metadata.pool_class,
             )
