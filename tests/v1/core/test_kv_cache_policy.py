@@ -70,8 +70,8 @@ class DummyKVCacheManager:
     def get_block_ids(self, request_id: str):
         return (self.block_ids[request_id],)
 
-    def get_agent_fixed_block_hashes(self, program_id: str, agent_id: str):
-        return self.fixed_hashes.get((program_id, agent_id), [])
+    def get_agent_fixed_block_hashes(self, workflow_id: str, agent_id: str):
+        return self.fixed_hashes.get((workflow_id, agent_id), [])
 
 
 class DummyBlocks:
@@ -193,6 +193,26 @@ def test_agent_fixed_hashes_are_keyed_by_workflow_agent():
 
     assert manager.get_agent_fixed_block_hashes("wf0", "a0") == [b"h0", b"h1"]
     assert manager.get_agent_fixed_block_hashes("p0", "a0") == []
+
+
+def test_agent_fixed_hashes_use_block_aligned_prefix_len():
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.hash_block_size = 2
+    manager._agent_fixed_block_hashes = {}
+
+    request = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="a0",
+            fixed_prefix_len=3,
+        ),
+        block_hashes=[b"h0", b"partial-fixed"],
+    )
+
+    manager._record_agent_fixed_block_hashes(request)
+
+    assert manager.get_agent_fixed_block_hashes("wf0", "a0") == [b"h0"]
 
 
 def test_agent_live_blocks_survive_free_and_are_removed_on_eviction():
@@ -368,6 +388,7 @@ def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
     policy = KVFlowOffloadPolicy()
     current_req = DummyRequest(
         KVRequestPolicyMetadata(
+            workflow_id="wf0",
             program_id="p0",
             agent_id="agent_a",
             next_agent_ids=["agent_b"],
@@ -376,6 +397,7 @@ def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
     )
     next_req = DummyRequest(
         KVRequestPolicyMetadata(
+            workflow_id="wf0",
             program_id="p0",
             agent_id="agent_b",
             fixed_prefix_len=4,
@@ -400,7 +422,7 @@ def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
         ),
         kv_cache_manager=DummyKVCacheManager(
             {},
-            fixed_hashes={("p0", "agent_b"): [b"fixed0", b"fixed1"]},
+            fixed_hashes={("wf0", "agent_b"): [b"fixed0", b"fixed1"]},
         ),
         token_budget=0,
         max_num_running_reqs=1,

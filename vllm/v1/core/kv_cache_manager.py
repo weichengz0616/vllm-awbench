@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
+    align_fixed_prefix_len,
     monotonic_time,
     ttl_deadline,
 )
@@ -451,8 +452,13 @@ class KVCacheManager:
         ):
             return
 
+        aligned_fixed_prefix_len = align_fixed_prefix_len(
+            metadata.fixed_prefix_len,
+            self.hash_block_size,
+        )
+        assert aligned_fixed_prefix_len is not None
         num_fixed_blocks = min(
-            metadata.fixed_prefix_len // self.hash_block_size,
+            aligned_fixed_prefix_len // self.hash_block_size,
             len(request.block_hashes),
         )
         if num_fixed_blocks <= 0:

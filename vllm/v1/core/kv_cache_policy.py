@@ -46,18 +46,27 @@ class KVBlockPolicyMetadata:
 
 @dataclass
 class KVRequestPolicyMetadata:
+    # Common agent/workflow identifiers.
+    # workflow_id identifies the workflow template; program_id identifies a
+    # concrete workflow instance.
     workflow_id: str | None = None
     program_id: str | None = None
     program_type: ProgramType | None = None
     agent_id: str | None = None
-    session_id: str | None = None
     fixed_prefix_len: int | None = None
+
+    # KVFlow-specific metadata.
     steps_to_execution: float | None = None
     agent_steps_to_execution: dict[str, float] = field(default_factory=dict)
     next_agent_ids: list[str] = field(default_factory=list)
+
+    # CacheTTL / Tokencake metadata.
     ttl_seconds: float | None = None
     is_program_last_step: bool = False
     critical: bool = False
+
+    # Offload / tool-call metadata.
+    session_id: str | None = None
     predicted_tool_time: float | None = None
     call_name: str | None = None
     call_duration: float | None = None
@@ -69,7 +78,7 @@ class KVRequestPolicyMetadata:
     ) -> "KVRequestPolicyMetadata":
         if not extra_args:
             return cls()
-        raw = extra_args.get("kv_cache_policy") or extra_args.get("agent_kv") or {}
+        raw = extra_args.get("awbench_meta")
         if not isinstance(raw, dict):
             return cls()
         steps_by_agent = raw.get("agent_steps_to_execution") or {}
@@ -89,7 +98,6 @@ class KVRequestPolicyMetadata:
             program_id=_as_str(raw.get("program_id")),
             program_type=program_type if program_type in ("dag", "react") else None,
             agent_id=_as_str(raw.get("agent_id")),
-            session_id=_as_str(raw.get("session_id")),
             fixed_prefix_len=_as_int(raw.get("fixed_prefix_len")),
             steps_to_execution=_as_float(raw.get("steps_to_execution")),
             agent_steps_to_execution={
@@ -101,6 +109,7 @@ class KVRequestPolicyMetadata:
             ttl_seconds=_as_float(raw.get("ttl_seconds")),
             is_program_last_step=bool(raw.get("is_program_last_step", False)),
             critical=bool(raw.get("critical", False)),
+            session_id=_as_str(raw.get("session_id")),
             predicted_tool_time=_as_float(
                 raw.get("predicted_tool_time")
                 if raw.get("predicted_tool_time") is not None
@@ -124,12 +133,8 @@ class KVRequestPolicyMetadata:
 
     @property
     def workflow_key(self) -> str | None:
-        """Identifier for workflow-template scoped agent state.
-
-        `workflow_id` is the intended app/template id. Falling back to
-        `program_id` keeps older `agent_kv` metadata usable.
-        """
-        return self.workflow_id or self.program_id
+        """Identifier for workflow-template scoped agent state."""
+        return self.workflow_id
 
 
 @dataclass
@@ -254,10 +259,24 @@ def get_prompt_part(
     block_size: int,
     fixed_prefix_len: int | None,
 ) -> PromptPart:
-    if fixed_prefix_len is None:
+    aligned_fixed_prefix_len = align_fixed_prefix_len(
+        fixed_prefix_len, block_size
+    )
+    if aligned_fixed_prefix_len is None:
         return "unknown"
     block_start = block_index * block_size
-    return "fixed" if block_start < fixed_prefix_len else "dynamic"
+    return "fixed" if block_start < aligned_fixed_prefix_len else "dynamic"
+
+
+def align_fixed_prefix_len(
+    fixed_prefix_len: int | None,
+    block_size: int,
+) -> int | None:
+    if fixed_prefix_len is None:
+        return None
+    if fixed_prefix_len <= 0:
+        return 0
+    return fixed_prefix_len // block_size * block_size
 
 
 def ttl_deadline(now: float, request_metadata: KVRequestPolicyMetadata) -> float | None:
