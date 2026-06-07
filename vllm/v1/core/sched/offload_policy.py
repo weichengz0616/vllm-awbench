@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import PREFETCH_POOL_REQ_ID
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 if TYPE_CHECKING:
@@ -31,6 +33,8 @@ class KVBlockRange:
     num_blocks: int
     block_hashes: list[BlockHash] = field(default_factory=list)
     gpu_block_ids: list[int] = field(default_factory=list)
+    workflow_id: str | None = None
+    agent_id: str | None = None
 
 
 @dataclass
@@ -100,6 +104,7 @@ class LoadDecisionContext:
     num_running_reqs: int
     scheduled_requests: list[Request] = field(default_factory=list)
     next_agent_ids_by_request_id: dict[str, list[str]] = field(default_factory=dict)
+    lookup_block_hashes: Callable[[list[BlockHash]], int | None] | None = None
     now: float = field(default_factory=time.monotonic)
 
 
@@ -512,78 +517,68 @@ class KVFlowOffloadPolicy(BaseAgentOffloadPolicy):
             sorted(successor_order),
         )
         block_ranges: list[KVBlockRange] = []
-        for request_info in context.request_infos:
-            request = request_info.request
-            metadata = self._metadata(request)
-            workflow_id = metadata.workflow_key
-            if workflow_id is None or metadata.agent_id is None:
-                continue
-            if (workflow_id, metadata.agent_id) not in successor_order:
-                continue
-            if (
-                request_info.allocated_blocks is None
-                or not request_info.load_kv_async
-            ):
-                continue
-
-            fixed_block_hashes = (
-                context.kv_cache_manager.get_agent_fixed_block_hashes(
-                    workflow_id,
-                    metadata.agent_id,
-                )
+        for workflow_id, agent_id in successor_order:
+            fixed_block_hashes = context.kv_cache_manager.get_agent_fixed_block_hashes(
+                workflow_id,
+                agent_id,
             )
-            if state.block_size_factor > 1:
-                fixed_block_hashes = fixed_block_hashes[
-                    state.block_size_factor - 1 :: state.block_size_factor
-                ]
             if not fixed_block_hashes:
                 continue
 
-            start_block_idx = min(
-                request_info.num_local_computed_tokens
-                // state.offloaded_block_size,
-                len(fixed_block_hashes),
+            missing_hashes = context.kv_cache_manager.get_missing_gpu_prefetch_hashes(
+                workflow_id,
+                agent_id,
+                fixed_block_hashes,
             )
-            if start_block_idx == len(fixed_block_hashes):
+            if not missing_hashes:
                 continue
 
-            block_ids = request_info.allocated_blocks.get_block_ids()[0]
-            num_computed_gpu_blocks = sum(
-                block.block_hash is not None
-                for block in request_info.allocated_blocks.blocks[0]
-            )
-            num_blocks = min(
-                len(fixed_block_hashes) - start_block_idx,
-                len(block_ids) - num_computed_gpu_blocks,
-            )
-            if num_blocks <= 0:
+            lookup_block_hashes = context.lookup_block_hashes
+            if lookup_block_hashes is None:
                 continue
+            ready_blocks = lookup_block_hashes(missing_hashes)
+            if ready_blocks is None or ready_blocks <= 0:
+                continue
+            block_hashes_to_load = missing_hashes[:ready_blocks]
 
+            allocated_blocks = context.kv_cache_manager.allocate_prefetch_blocks(
+                workflow_id=workflow_id,
+                agent_id=agent_id,
+                block_hashes=block_hashes_to_load,
+            )
+            if allocated_blocks is None:
+                continue
+            gpu_block_ids = allocated_blocks.get_block_ids()[0]
             block_ranges.append(
                 KVBlockRange(
-                    req_id=request.request_id,
-                    start_block_idx=start_block_idx,
-                    num_blocks=num_blocks,
-                    block_hashes=fixed_block_hashes[
-                        start_block_idx : start_block_idx + num_blocks
-                    ],
-                    gpu_block_ids=block_ids[
-                        num_computed_gpu_blocks : num_computed_gpu_blocks
-                        + num_blocks
-                    ],
+                    req_id=PREFETCH_POOL_REQ_ID,
+                    start_block_idx=0,
+                    num_blocks=len(block_hashes_to_load),
+                    block_hashes=block_hashes_to_load,
+                    gpu_block_ids=gpu_block_ids,
+                    workflow_id=workflow_id,
+                    agent_id=agent_id,
                 )
             )
             logger.info(
-                "awbench ---- KVFlow planned fixed-prefix KV load: request_id=%s "
-                "workflow_id=%s agent_id=%s start_block_idx=%d num_blocks=%d",
-                request.request_id,
+                "awbench ---- KVFlow planned fixed-prefix KV prefetch: "
+                "workflow_id=%s agent_id=%s num_blocks=%d gpu_block_ids=%s",
                 workflow_id,
-                metadata.agent_id,
-                start_block_idx,
-                num_blocks,
+                agent_id,
+                len(block_hashes_to_load),
+                gpu_block_ids,
             )
+            break
 
         def load_priority(block_range: KVBlockRange) -> tuple[int, int]:
+            if block_range.workflow_id is not None and block_range.agent_id is not None:
+                return (
+                    successor_order.get(
+                        (block_range.workflow_id, block_range.agent_id),
+                        len(successor_order),
+                    ),
+                    block_range.start_block_idx,
+                )
             request = next(
                 (
                     info.request

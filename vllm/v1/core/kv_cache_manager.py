@@ -20,12 +20,16 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
     KVCacheBlock,
+    get_block_hash,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# q6: 如何持有 prefetch 的 block
+PREFETCH_POOL_REQ_ID = "prefetch_pool"
 
 
 @dataclass
@@ -155,6 +159,7 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
         self._agent_fixed_block_hashes: dict[tuple[str, str], list[BlockHash]] = {}
+        self._prefetch_loading: dict[BlockHash, KVCacheBlock] = {}
         logger.info(
             "awbench ---- Initialized KV cache manager with agent eviction policy=%s, "
             "tokencake_reserved_ratio=%.4f, hash_block_size=%d, "
@@ -377,7 +382,6 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
-
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -494,6 +498,115 @@ class KVCacheManager:
         agent_id: str,
     ) -> dict[BlockHashWithGroupId, list[KVCacheBlock]]:
         return self.block_pool.get_agent_live_blocks(workflow_id, agent_id)
+
+    def get_missing_gpu_prefetch_hashes(
+        self,
+        workflow_id: str,
+        agent_id: str,
+        block_hashes: list[BlockHash],
+    ) -> list[BlockHash]:
+        live_blocks = self.get_agent_live_blocks(workflow_id, agent_id)
+        live_hashes = {
+            get_block_hash(block_hash_with_group_id)
+            for block_hash_with_group_id in live_blocks
+        }
+        missing_hashes: list[BlockHash] = []
+        for block_hash in block_hashes:
+            if block_hash in live_hashes:
+                continue
+            if block_hash in self._prefetch_loading:
+                continue
+            missing_hashes.append(block_hash)
+        return missing_hashes
+
+    def has_pending_prefetch(self, request: Request) -> bool:
+        metadata = request.kv_cache_policy_metadata
+        workflow_id = metadata.workflow_key
+        if workflow_id is None or metadata.agent_id is None:
+            return False
+        fixed_block_hashes = self.get_agent_fixed_block_hashes(
+            workflow_id, metadata.agent_id
+        )
+        if not fixed_block_hashes:
+            return False
+        return any(
+            block_hash in self._prefetch_loading
+            for block_hash in fixed_block_hashes
+        )
+
+    def allocate_prefetch_blocks(
+        self,
+        workflow_id: str,
+        agent_id: str,
+        block_hashes: list[BlockHash],
+    ) -> KVCacheBlocks | None:
+        if not block_hashes:
+            return self.empty_kv_cache_blocks
+        if self.num_kv_cache_groups != 1:
+            logger.warning(
+                "awbench ---- Skipping KV prefetch for hybrid KV cache: "
+                "workflow_id=%s agent_id=%s num_groups=%d",
+                workflow_id,
+                agent_id,
+                self.num_kv_cache_groups,
+            )
+            return None
+        if len(block_hashes) > self.block_pool.get_num_free_blocks():
+            logger.info(
+                "awbench ---- Skipping KV prefetch due to insufficient GPU "
+                "blocks: workflow_id=%s agent_id=%s need=%d free=%d",
+                workflow_id,
+                agent_id,
+                len(block_hashes),
+                self.block_pool.get_num_free_blocks(),
+            )
+            return None
+
+        manager = self.coordinator.single_type_managers[0]
+        blocks = self.block_pool.get_new_blocks(len(block_hashes))
+        manager.req_to_blocks[PREFETCH_POOL_REQ_ID].extend(blocks)
+        for block_hash, block in zip(block_hashes, blocks):
+            self.block_pool.bind_prefetch_block_metadata(
+                block=block,
+                workflow_id=workflow_id,
+                agent_id=agent_id,
+                status="loading",
+            )
+            self._prefetch_loading[block_hash] = block
+        return self.create_kv_cache_blocks((blocks,))
+
+    def complete_prefetch_loads(self) -> None:
+        if not self._prefetch_loading:
+            return
+        block_hashes = list(self._prefetch_loading)
+        blocks = [
+            self._prefetch_loading[block_hash]
+            for block_hash in block_hashes
+        ]
+        self.block_pool.cache_prefetch_blocks(
+            block_hashes=block_hashes,
+            blocks=blocks,
+            kv_cache_group_id=0,
+        )
+        for block_hash in block_hashes:
+            self._prefetch_loading.pop(block_hash)
+        prefetch_req_blocks = (
+            self.coordinator.single_type_managers[0]
+            .req_to_blocks
+            .get(PREFETCH_POOL_REQ_ID, [])
+        )
+        for block in blocks:
+            if block in prefetch_req_blocks:
+                prefetch_req_blocks.remove(block)
+        if not prefetch_req_blocks:
+            self.coordinator.single_type_managers[0].req_to_blocks.pop(
+                PREFETCH_POOL_REQ_ID, None
+            )
+        self.block_pool.free_blocks(blocks)
+        logger.info(
+            "awbench ---- Completed KV prefetch loads: num_blocks=%d",
+            len(block_hashes),
+        )
 
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.

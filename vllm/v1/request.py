@@ -159,6 +159,7 @@ class Request:
         # metadata. Used to avoid reapplying the same metadata after preemption
         # or across decode scheduling iterations.
         self.kv_cache_policy_metadata_applied = False
+        self.waiting_for_prefetch = False
 
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False

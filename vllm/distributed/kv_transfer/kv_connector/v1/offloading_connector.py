@@ -209,6 +209,10 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_blocks_being_loaded()
 
+    def lookup_block_hashes(self, block_hashes: list[BlockHash]) -> int | None:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.lookup_block_hashes(block_hashes)
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
@@ -295,6 +299,9 @@ class OffloadingConnectorScheduler:
 
     def get_blocks_being_loaded(self) -> set[BlockHash] | None:
         return self._blocks_being_loaded
+
+    def lookup_block_hashes(self, block_hashes: list[BlockHash]) -> int | None:
+        return self.manager.lookup(block_hashes)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int

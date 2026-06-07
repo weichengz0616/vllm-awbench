@@ -36,7 +36,11 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
-from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheBlocks,
+    KVCacheManager,
+    PREFETCH_POOL_REQ_ID,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
 from vllm.v1.core.sched.offload_policy import (
@@ -317,6 +321,16 @@ class Scheduler(SchedulerInterface):
             return None
 
         return get_blocks_being_loaded()
+
+    def _lookup_offloaded_block_hashes(self, block_hashes):
+        if self.connector is None:
+            return None
+
+        lookup_block_hashes = getattr(self.connector, "lookup_block_hashes", None)
+        if lookup_block_hashes is None:
+            return None
+
+        return lookup_block_hashes(block_hashes)
 
     def _mamba_block_aligned_split(
         self,
@@ -646,6 +660,21 @@ class Scheduler(SchedulerInterface):
                 ):
                     self.kv_cache_manager.on_request_metadata(request)
                     request.kv_cache_policy_metadata_applied = True
+
+                if (
+                    request.status == RequestStatus.WAITING
+                    and self.kv_cache_manager.has_pending_prefetch(request)
+                ):
+                    request.waiting_for_prefetch = True
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
+                    logger.info(
+                        "awbench ---- Request waiting for KV prefetch: "
+                        "request_id=%s",
+                        request.request_id,
+                    )
+                    continue
 
                 num_external_computed_tokens = 0
                 load_kv_async = False
@@ -1005,6 +1034,7 @@ class Scheduler(SchedulerInterface):
                 num_running_reqs=len(self.running),
                 scheduled_requests=scheduled_requests,
                 next_agent_ids_by_request_id=next_agent_ids_by_request_id,
+                lookup_block_hashes=self._lookup_offloaded_block_hashes,
             )
         )
         offload_plan = self.offload_policy.get_offload_plan(
@@ -2098,6 +2128,12 @@ class Scheduler(SchedulerInterface):
         WAITING_FOR_REMOTE_KV.
         """
         assert self.connector is not None
+        if request.waiting_for_prefetch:
+            if self.kv_cache_manager.has_pending_prefetch(request):
+                return False
+            request.waiting_for_prefetch = False
+            return True
+
         if request.request_id not in self.finished_recving_kv_req_ids:
             return False
 
@@ -2147,6 +2183,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
+            if req_id == PREFETCH_POOL_REQ_ID:
+                logger.debug("Finished recving KV prefetch pool transfer")
+                self.kv_cache_manager.complete_prefetch_loads()
+                continue
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]

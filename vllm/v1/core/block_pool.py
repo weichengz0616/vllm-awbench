@@ -458,6 +458,56 @@ class BlockPool:
                 metadata.pool_class,
             )
 
+    def bind_prefetch_block_metadata(
+        self,
+        block: KVCacheBlock,
+        workflow_id: str,
+        agent_id: str,
+        status: str = "loading",
+    ) -> None:
+        metadata = self.block_metadata[block.block_id]
+        metadata.workflow_id = workflow_id
+        metadata.program_id = None
+        metadata.agent_id = agent_id
+        metadata.prompt_part = "fixed"
+        metadata.critical = False
+        metadata.status = status  # type: ignore[assignment]
+        logger.info(
+            "awbench ---- Bound KV prefetch block metadata: block_id=%d "
+            "workflow_id=%s agent_id=%s status=%s",
+            block.block_id,
+            workflow_id,
+            agent_id,
+            status,
+        )
+
+    def cache_prefetch_blocks(
+        self,
+        block_hashes: list[BlockHash],
+        blocks: list[KVCacheBlock],
+        kv_cache_group_id: int,
+    ) -> None:
+        assert len(block_hashes) == len(blocks)
+        for block_hash, block in zip(block_hashes, blocks):
+            if block.is_null:
+                continue
+            assert block.block_hash is None
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, kv_cache_group_id
+            )
+            block.block_hash = block_hash_with_group_id
+            self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+            self.block_metadata[block.block_id].status = "gpu"
+            self._maybe_record_agent_live_block(block, block_hash_with_group_id)
+            logger.info(
+                "awbench ---- Cached KV prefetched block: block_id=%d "
+                "block_hash=%s workflow_id=%s agent_id=%s",
+                block.block_id,
+                block_hash_with_group_id,
+                self.block_metadata[block.block_id].workflow_id,
+                self.block_metadata[block.block_id].agent_id,
+            )
+
     def set_ttl_deadline_for_blocks(
         self, blocks: Iterable[KVCacheBlock], ttl_deadline: float
     ) -> None:

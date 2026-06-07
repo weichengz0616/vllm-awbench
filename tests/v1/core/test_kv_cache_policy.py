@@ -6,7 +6,7 @@ import pytest
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
-from vllm.v1.core.kv_cache_manager import KVCacheManager
+from vllm.v1.core.kv_cache_manager import KVCacheManager, PREFETCH_POOL_REQ_ID
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.sched.offload_policy import (
     DefaultOffloadPolicy,
@@ -69,15 +69,29 @@ class DummyKVCacheManager:
         self,
         block_ids: dict[str, list[int]],
         fixed_hashes: dict[tuple[str, str], list[bytes]] | None = None,
+        live_hashes: set[bytes] | None = None,
     ):
         self.block_ids = block_ids
         self.fixed_hashes = fixed_hashes or {}
+        self.live_hashes = live_hashes or set()
+        self.prefetch_allocations: list[tuple[str, str, list[bytes]]] = []
 
     def get_block_ids(self, request_id: str):
         return (self.block_ids[request_id],)
 
     def get_agent_fixed_block_hashes(self, workflow_id: str, agent_id: str):
         return self.fixed_hashes.get((workflow_id, agent_id), [])
+
+    def get_missing_gpu_prefetch_hashes(
+        self, workflow_id: str, agent_id: str, block_hashes: list[bytes]
+    ):
+        return [h for h in block_hashes if h not in self.live_hashes]
+
+    def allocate_prefetch_blocks(
+        self, workflow_id: str, agent_id: str, block_hashes: list[bytes]
+    ):
+        self.prefetch_allocations.append((workflow_id, agent_id, block_hashes))
+        return DummyBlocks(list(range(100, 100 + len(block_hashes))))
 
 
 class DummyBlocks:
@@ -467,47 +481,34 @@ def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
         ),
         request_id="current",
     )
-    next_req = DummyRequest(
-        KVRequestPolicyMetadata(
-            workflow_id="wf0",
-            program_id="p0",
-            agent_id="agent_b",
-            fixed_prefix_len=4,
-        ),
-        request_id="next",
-        block_hashes=[b"unused0", b"unused1", b"unused2"],
+    kv_cache_manager = DummyKVCacheManager(
+        {},
+        fixed_hashes={("wf0", "agent_b"): [b"fixed0", b"fixed1"]},
     )
     context = LoadDecisionContext(
-        request_infos=[
-            LoadRequestInfo(
-                request=next_req,
-                num_local_computed_tokens=0,
-                num_external_computed_tokens=4,
-                load_kv_async=True,
-                allocated_blocks=DummyBlocks([11, 12, 13]),
-            )
-        ],
+        request_infos=[],
         offload_state=OffloadPolicyState(
             gpu_block_size=2,
             offloaded_block_size=2,
             block_size_factor=1,
         ),
-        kv_cache_manager=DummyKVCacheManager(
-            {},
-            fixed_hashes={("wf0", "agent_b"): [b"fixed0", b"fixed1"]},
-        ),
+        kv_cache_manager=kv_cache_manager,
         token_budget=0,
         max_num_running_reqs=1,
         num_running_reqs=1,
         scheduled_requests=[current_req],
+        lookup_block_hashes=lambda block_hashes: len(block_hashes),
     )
 
     plan = policy.get_load_plan(context)
 
     assert len(plan.block_ranges) == 1
-    assert plan.block_ranges[0].req_id == "next"
+    assert plan.block_ranges[0].req_id == PREFETCH_POOL_REQ_ID
     assert plan.block_ranges[0].block_hashes == [b"fixed0", b"fixed1"]
-    assert plan.block_ranges[0].gpu_block_ids == [11, 12]
+    assert plan.block_ranges[0].gpu_block_ids == [100, 101]
+    assert kv_cache_manager.prefetch_allocations == [
+        ("wf0", "agent_b", [b"fixed0", b"fixed1"])
+    ]
 
 
 def test_tokencake_offload_policy_offloads_call_start_stall():
