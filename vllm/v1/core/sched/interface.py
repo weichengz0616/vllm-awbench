@@ -168,6 +168,11 @@ class SchedulerInterface(ABC):
         return self.has_unfinished_requests() or self.has_finished_requests()
 
     @abstractmethod
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        """Notify KV cache policies that a program has finished."""
+        raise NotImplementedError
+
+    @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

@@ -6,7 +6,12 @@ import pytest
 
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
-from vllm.v1.core.kv_cache_manager import KVCacheManager, PREFETCH_POOL_REQ_ID
+from vllm.v1.core.kv_cache_manager import (
+    KVCacheManager,
+    MAX_INFLIGHT_PREFETCH_BATCHES,
+    PREFETCH_POOL_REQ_ID,
+    is_prefetch_request_id,
+)
 from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
 from vllm.v1.core.sched.offload_policy import (
     DefaultOffloadPolicy,
@@ -75,6 +80,7 @@ class DummyKVCacheManager:
         self.fixed_hashes = fixed_hashes or {}
         self.live_hashes = live_hashes or set()
         self.prefetch_allocations: list[tuple[str, str, list[bytes]]] = []
+        self.next_prefetch_id = 0
 
     def get_block_ids(self, request_id: str):
         return (self.block_ids[request_id],)
@@ -91,12 +97,23 @@ class DummyKVCacheManager:
         self, workflow_id: str, agent_id: str, block_hashes: list[bytes]
     ):
         self.prefetch_allocations.append((workflow_id, agent_id, block_hashes))
-        return DummyBlocks(list(range(100, 100 + len(block_hashes))))
+        request_id = f"{PREFETCH_POOL_REQ_ID}:{self.next_prefetch_id}"
+        self.next_prefetch_id += 1
+        return DummyBlocks(
+            list(range(100, 100 + len(block_hashes))),
+            request_id=request_id,
+        )
 
 
 class DummyBlocks:
-    def __init__(self, block_ids: list[int], computed_blocks: int = 0):
+    def __init__(
+        self,
+        block_ids: list[int],
+        computed_blocks: int = 0,
+        request_id: str | None = None,
+    ):
         self._block_ids = block_ids
+        self.request_id = request_id
         self.blocks = (
             [
                 SimpleNamespace(
@@ -196,6 +213,20 @@ def test_request_policy_metadata_parses_workflow_id():
     assert metadata.workflow_key == "workflow-template"
 
 
+def test_request_policy_metadata_accepts_external_template_id():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "awbench_meta": {
+                "template_id": "legacy-template",
+                "program_id": "program-instance",
+            }
+        }
+    )
+
+    assert metadata.workflow_id == "legacy-template"
+    assert metadata.workflow_key == "legacy-template"
+
+
 def test_agent_fixed_hashes_are_keyed_by_workflow_agent():
     manager = KVCacheManager.__new__(KVCacheManager)
     manager.hash_block_size = 2
@@ -266,10 +297,75 @@ def test_agent_live_blocks_survive_free_and_are_removed_on_eviction():
     pool.free_blocks([block])
     assert pool.get_agent_live_blocks("wf0", "a0")[block_hash] == [block]
 
+    fresh_block = pool.get_new_blocks(1)[0]
+    assert fresh_block is not block
+
     evicted_block = pool.get_new_blocks(1)[0]
 
     assert evicted_block is block
     assert pool.get_agent_live_blocks("wf0", "a0") == {}
+
+
+def test_cached_fixed_hit_registers_shared_agent_contribution():
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=True,
+        hash_block_size=2,
+        eviction_policy="kvflow",
+    )
+    request_a = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="agent_a",
+            fixed_prefix_len=2,
+            steps_to_execution=5,
+        ),
+        block_hashes=[b"shared"],
+    )
+    block = pool.get_new_blocks(1)[0]
+    pool.bind_block_metadata(block, request_a, block_index=0, block_size=2)
+    pool.cache_full_blocks(
+        request=request_a,
+        blocks=[block],
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=2,
+        kv_cache_group_id=0,
+    )
+
+    request_b = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p1",
+            agent_id="agent_b",
+            fixed_prefix_len=2,
+            steps_to_execution=1,
+        ),
+        request_id="r1",
+        block_hashes=[b"shared"],
+    )
+    pool.record_cached_block_hit_metadata(
+        block=block,
+        request=request_b,
+        block_index=0,
+        block_size=2,
+    )
+
+    block_hash = make_block_hash_with_group_id(b"shared", 0)
+    metadata = pool.get_block_metadata(block)
+
+    assert pool.get_agent_live_blocks("wf0", "agent_a")[block_hash] == [block]
+    assert pool.get_agent_live_blocks("wf0", "agent_b")[block_hash] == [block]
+    assert metadata.step_contributions == {
+        ("p0", "agent_a"): 5,
+        ("p1", "agent_b"): 1,
+    }
+    assert metadata.steps_to_execution == 1
+
+    assert pool._maybe_evict_cached_block(block)
+    assert pool.get_agent_live_blocks("wf0", "agent_a") == {}
+    assert pool.get_agent_live_blocks("wf0", "agent_b") == {}
 
 
 def test_kvflow_program_contributions_update_live_fixed_blocks():
@@ -335,6 +431,56 @@ def test_kvflow_program_contributions_update_live_fixed_blocks():
     assert metadata.step_contributions == {("p0", "a0"): 4}
     assert metadata.steps_to_execution == 4
 
+
+
+def test_finish_program_clears_kvflow_program_contributions():
+    pool = BlockPool(
+        num_gpu_blocks=4,
+        enable_caching=False,
+        hash_block_size=2,
+        eviction_policy="kvflow",
+    )
+    metadata = pool.block_metadata[1]
+    metadata.workflow_id = "wf0"
+    metadata.prompt_part = "fixed"
+    metadata.step_contributions = {
+        ("p0", "a0"): 4,
+        ("p1", "a0"): 1,
+    }
+    metadata.steps_to_execution = 1
+
+    other_workflow = pool.block_metadata[2]
+    other_workflow.workflow_id = "wf1"
+    other_workflow.prompt_part = "fixed"
+    other_workflow.step_contributions = {("p1", "a0"): 0}
+    other_workflow.steps_to_execution = 0
+
+    removed = pool.finish_program("wf0", "p1")
+
+    assert removed == 1
+    assert metadata.step_contributions == {("p0", "a0"): 4}
+    assert metadata.steps_to_execution == 4
+    assert other_workflow.step_contributions == {("p1", "a0"): 0}
+    assert other_workflow.steps_to_execution == 0
+
+
+def test_finish_program_is_noop_for_non_kvflow_policy():
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=False,
+        hash_block_size=2,
+        eviction_policy="cachettl",
+    )
+    metadata = pool.block_metadata[1]
+    metadata.workflow_id = "wf0"
+    metadata.step_contributions = {("p0", "a0"): 1}
+    metadata.steps_to_execution = 1
+
+    removed = pool.finish_program("wf0", "p0")
+
+    assert removed == 0
+    assert metadata.step_contributions == {("p0", "a0"): 1}
+    assert metadata.steps_to_execution == 1
 
 def test_kvflow_offload_policy_stores_fixed_prefix_only():
     policy = KVFlowOffloadPolicy()
@@ -503,12 +649,138 @@ def test_kvflow_load_policy_prefetches_next_agent_fixed_prompt_hashes():
     plan = policy.get_load_plan(context)
 
     assert len(plan.block_ranges) == 1
-    assert plan.block_ranges[0].req_id == PREFETCH_POOL_REQ_ID
+    assert is_prefetch_request_id(plan.block_ranges[0].req_id)
+    assert plan.block_ranges[0].req_id != PREFETCH_POOL_REQ_ID
     assert plan.block_ranges[0].block_hashes == [b"fixed0", b"fixed1"]
     assert plan.block_ranges[0].gpu_block_ids == [100, 101]
     assert kv_cache_manager.prefetch_allocations == [
         ("wf0", "agent_b", [b"fixed0", b"fixed1"])
     ]
+
+
+def test_kvflow_load_policy_prioritizes_external_hit_load_before_prefetch():
+    policy = KVFlowOffloadPolicy()
+    state = OffloadPolicyState(
+        gpu_block_size=2,
+        offloaded_block_size=2,
+        block_size_factor=1,
+    )
+    external_hit_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="agent_x",
+        ),
+        request_id="external",
+        block_hashes=[b"external0", b"external1"],
+    )
+    current_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            workflow_id="wf0",
+            program_id="p0",
+            agent_id="agent_a",
+            next_agent_ids=["agent_b"],
+        ),
+        request_id="current",
+    )
+    request_info = LoadRequestInfo(
+        request=external_hit_req,
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=2,
+        load_kv_async=True,
+        allocated_blocks=DummyBlocks([11, 12]),
+    )
+    policy.should_schedule_load_candidate(
+        LoadCandidateContext(
+            request=external_hit_req,
+            num_local_computed_tokens=0,
+            num_external_computed_tokens=2,
+            load_kv_async=True,
+            offload_state=state,
+            blocks_being_loaded=set(),
+        )
+    )
+    policy.record_scheduled_load(request_info)
+    kv_cache_manager = DummyKVCacheManager(
+        {},
+        fixed_hashes={("wf0", "agent_b"): [b"fixed0"]},
+    )
+
+    plan = policy.get_load_plan(
+        LoadDecisionContext(
+            request_infos=[request_info],
+            offload_state=state,
+            kv_cache_manager=kv_cache_manager,
+            token_budget=0,
+            max_num_running_reqs=1,
+            num_running_reqs=1,
+            scheduled_requests=[current_req],
+            lookup_block_hashes=lambda block_hashes: len(block_hashes),
+        )
+    )
+
+    assert len(plan.block_ranges) == 2
+    assert plan.block_ranges[0].req_id == "external"
+    assert plan.block_ranges[0].block_hashes == [b"external0"]
+    assert is_prefetch_request_id(plan.block_ranges[1].req_id)
+    assert plan.block_ranges[1].block_hashes == [b"fixed0"]
+
+
+
+def test_prefetch_manager_uses_unique_batches_and_limits_inflight():
+    class DummyBlockPool:
+        def __init__(self):
+            self.next_block_id = 1
+            self.bound = []
+
+        def get_num_free_blocks(self):
+            return 100
+
+        def get_new_blocks(self, num_blocks):
+            blocks = [
+                SimpleNamespace(block_id=self.next_block_id + i, is_null=False)
+                for i in range(num_blocks)
+            ]
+            self.next_block_id += num_blocks
+            return blocks
+
+        def bind_prefetch_block_metadata(
+            self, block, workflow_id, agent_id, status="loading"
+        ):
+            self.bound.append((block.block_id, workflow_id, agent_id, status))
+
+    manager = KVCacheManager.__new__(KVCacheManager)
+    manager.num_kv_cache_groups = 1
+    manager.empty_kv_cache_blocks = DummyBlocks([])
+    manager.block_pool = DummyBlockPool()
+    manager.coordinator = SimpleNamespace(
+        single_type_managers=[SimpleNamespace(req_to_blocks={})]
+    )
+    manager._prefetch_batches = {}
+    manager._prefetch_loading = {}
+    manager._next_prefetch_batch_id = 0
+
+    request_ids = []
+    for i in range(MAX_INFLIGHT_PREFETCH_BATCHES):
+        blocks = manager.allocate_prefetch_blocks(
+            workflow_id="wf0",
+            agent_id=f"agent_{i}",
+            block_hashes=[f"h{i}".encode()],
+        )
+        assert blocks is not None
+        assert blocks.request_id is not None
+        request_ids.append(blocks.request_id)
+
+    assert len(set(request_ids)) == MAX_INFLIGHT_PREFETCH_BATCHES
+    assert all(is_prefetch_request_id(req_id) for req_id in request_ids)
+    assert set(manager._prefetch_batches) == set(request_ids)
+    assert len(manager._prefetch_loading) == MAX_INFLIGHT_PREFETCH_BATCHES
+    assert manager.allocate_prefetch_blocks(
+        workflow_id="wf0",
+        agent_id="overflow",
+        block_hashes=[b"overflow"],
+    ) is None
+
 
 
 def test_tokencake_offload_policy_offloads_call_start_stall():

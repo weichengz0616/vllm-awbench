@@ -39,7 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import (
     KVCacheBlocks,
     KVCacheManager,
-    PREFETCH_POOL_REQ_ID,
+    is_prefetch_request_id,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
@@ -1937,6 +1937,9 @@ class Scheduler(SchedulerInterface):
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
 
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return self.kv_cache_manager.finish_program(workflow_id, program_id)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2183,9 +2186,9 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
-            if req_id == PREFETCH_POOL_REQ_ID:
-                logger.debug("Finished recving KV prefetch pool transfer")
-                self.kv_cache_manager.complete_prefetch_loads()
+            if is_prefetch_request_id(req_id):
+                logger.debug("Finished recving KV prefetch transfer %s", req_id)
+                self.kv_cache_manager.complete_prefetch_loads(req_id)
                 continue
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests

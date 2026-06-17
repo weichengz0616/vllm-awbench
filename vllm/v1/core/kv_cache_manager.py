@@ -30,6 +30,23 @@ logger = init_logger(__name__)
 
 # q6: 如何持有 prefetch 的 block
 PREFETCH_POOL_REQ_ID = "prefetch_pool"
+MAX_INFLIGHT_PREFETCH_BATCHES = 5
+
+
+def is_prefetch_request_id(request_id: str) -> bool:
+    return (
+        request_id == PREFETCH_POOL_REQ_ID
+        or request_id.startswith(f"{PREFETCH_POOL_REQ_ID}:")
+    )
+
+
+@dataclass
+class PrefetchBatch:
+    request_id: str
+    workflow_id: str
+    agent_id: str
+    block_hashes: list[BlockHash]
+    blocks: list[KVCacheBlock]
 
 
 @dataclass
@@ -41,6 +58,7 @@ class KVCacheBlocks:
     """
 
     blocks: tuple[Sequence[KVCacheBlock], ...]
+    request_id: str | None = None
     """
     `blocks[i][j]` refers to the i-th kv_cache_group
     and the j-th block of tokens.We don't use block of
@@ -159,7 +177,9 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
         self._agent_fixed_block_hashes: dict[tuple[str, str], list[BlockHash]] = {}
-        self._prefetch_loading: dict[BlockHash, KVCacheBlock] = {}
+        self._prefetch_batches: dict[str, PrefetchBatch] = {}
+        self._prefetch_loading: dict[BlockHash, str] = {}
+        self._next_prefetch_batch_id = 0
         logger.info(
             "awbench ---- Initialized KV cache manager with agent eviction policy=%s, "
             "tokencake_reserved_ratio=%.4f, hash_block_size=%d, "
@@ -193,6 +213,9 @@ class KVCacheManager:
 
     def on_request_metadata(self, request: Request) -> None:
         self.block_pool.on_request_metadata(request)
+
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return self.block_pool.finish_program(workflow_id, program_id)
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
@@ -382,6 +405,12 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
             )
+            if num_new_computed_tokens > 0:
+                self._record_request_metadata_for_cached_blocks(
+                    request=request,
+                    start_token=request.num_computed_tokens,
+                    end_token=num_local_computed_tokens,
+                )
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
             num_tokens_need_slot,
@@ -409,6 +438,29 @@ class KVCacheManager:
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
 
         return self.create_kv_cache_blocks(new_blocks)
+
+    def _record_request_metadata_for_cached_blocks(
+        self,
+        request: Request,
+        start_token: int,
+        end_token: int,
+    ) -> None:
+        if end_token <= start_token:
+            return
+        for group_blocks, manager in zip(
+            self.coordinator.get_blocks(request.request_id),
+            self.coordinator.single_type_managers,
+        ):
+            block_size = manager.block_size
+            start_block_index = start_token // block_size
+            end_block_index = min(end_token // block_size, len(group_blocks))
+            for block_index in range(start_block_index, end_block_index):
+                self.block_pool.record_cached_block_hit_metadata(
+                    block=group_blocks[block_index],
+                    request=request,
+                    block_index=block_index,
+                    block_size=block_size,
+                )
 
     def _bind_request_metadata_to_new_blocks(
         self,
@@ -542,6 +594,16 @@ class KVCacheManager:
     ) -> KVCacheBlocks | None:
         if not block_hashes:
             return self.empty_kv_cache_blocks
+        if len(self._prefetch_batches) >= MAX_INFLIGHT_PREFETCH_BATCHES:
+            logger.info(
+                "awbench ---- Skipping KV prefetch due to in-flight batch limit: "
+                "workflow_id=%s agent_id=%s inflight=%d limit=%d",
+                workflow_id,
+                agent_id,
+                len(self._prefetch_batches),
+                MAX_INFLIGHT_PREFETCH_BATCHES,
+            )
+            return None
         if self.num_kv_cache_groups != 1:
             logger.warning(
                 "awbench ---- Skipping KV prefetch for hybrid KV cache: "
@@ -562,9 +624,10 @@ class KVCacheManager:
             )
             return None
 
+        request_id = self._new_prefetch_request_id()
         manager = self.coordinator.single_type_managers[0]
         blocks = self.block_pool.get_new_blocks(len(block_hashes))
-        manager.req_to_blocks[PREFETCH_POOL_REQ_ID].extend(blocks)
+        manager.req_to_blocks.setdefault(request_id, []).extend(blocks)
         for block_hash, block in zip(block_hashes, blocks):
             self.block_pool.bind_prefetch_block_metadata(
                 block=block,
@@ -572,40 +635,61 @@ class KVCacheManager:
                 agent_id=agent_id,
                 status="loading",
             )
-            self._prefetch_loading[block_hash] = block
-        return self.create_kv_cache_blocks((blocks,))
+            self._prefetch_loading[block_hash] = request_id
+        self._prefetch_batches[request_id] = PrefetchBatch(
+            request_id=request_id,
+            workflow_id=workflow_id,
+            agent_id=agent_id,
+            block_hashes=list(block_hashes),
+            blocks=list(blocks),
+        )
+        return KVCacheBlocks((blocks,), request_id=request_id)
 
-    def complete_prefetch_loads(self) -> None:
-        if not self._prefetch_loading:
+    def _new_prefetch_request_id(self) -> str:
+        while True:
+            request_id = f"{PREFETCH_POOL_REQ_ID}:{self._next_prefetch_batch_id}"
+            self._next_prefetch_batch_id += 1
+            if request_id not in self._prefetch_batches:
+                return request_id
+
+    def complete_prefetch_loads(self, request_id: str) -> None:
+        batch = self._prefetch_batches.pop(request_id, None)
+        if batch is None:
+            logger.warning(
+                "awbench ---- Ignoring unknown completed KV prefetch batch: "
+                "request_id=%s",
+                request_id,
+            )
             return
-        block_hashes = list(self._prefetch_loading)
-        blocks = [
-            self._prefetch_loading[block_hash]
-            for block_hash in block_hashes
-        ]
+
         self.block_pool.cache_prefetch_blocks(
-            block_hashes=block_hashes,
-            blocks=blocks,
+            block_hashes=batch.block_hashes,
+            blocks=batch.blocks,
             kv_cache_group_id=0,
         )
-        for block_hash in block_hashes:
-            self._prefetch_loading.pop(block_hash)
+        for block_hash in batch.block_hashes:
+            self._prefetch_loading.pop(block_hash, None)
+
         prefetch_req_blocks = (
             self.coordinator.single_type_managers[0]
             .req_to_blocks
-            .get(PREFETCH_POOL_REQ_ID, [])
+            .get(request_id, [])
         )
-        for block in blocks:
+        for block in batch.blocks:
             if block in prefetch_req_blocks:
                 prefetch_req_blocks.remove(block)
         if not prefetch_req_blocks:
             self.coordinator.single_type_managers[0].req_to_blocks.pop(
-                PREFETCH_POOL_REQ_ID, None
+                request_id, None
             )
-        self.block_pool.free_blocks(blocks)
+        self.block_pool.free_blocks(batch.blocks)
         logger.info(
-            "awbench ---- Completed KV prefetch loads: num_blocks=%d",
-            len(block_hashes),
+            "awbench ---- Completed KV prefetch loads: request_id=%s "
+            "workflow_id=%s agent_id=%s num_blocks=%d",
+            request_id,
+            batch.workflow_id,
+            batch.agent_id,
+            len(batch.block_hashes),
         )
 
     def free(self, request: Request) -> None:

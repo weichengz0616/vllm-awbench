@@ -344,6 +344,9 @@ class LLMEngine:
         """
         self.engine_core.reset_encoder_cache()
 
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return self.engine_core.finish_program(workflow_id, program_id)
+
     def sleep(self, level: int = 1):
         self.engine_core.sleep(level)
 

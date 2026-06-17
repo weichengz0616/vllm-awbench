@@ -593,6 +593,9 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return self.scheduler.finish_program(workflow_id, program_id)
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

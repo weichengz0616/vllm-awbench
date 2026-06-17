@@ -180,6 +180,12 @@ class FreeBlockEvictionPolicy(ABC):
         """Update metadata after a newly allocated block is bound to a request."""
         return
 
+    def on_cached_block_metadata_hit(
+        self, context: Any, block: KVCacheBlock, prompt_part: Any
+    ) -> None:
+        """Update metadata when an existing cached block is reused."""
+        return
+
     @abstractmethod
     def select_victims(
         self, queue: "FreeKVCacheBlockQueue", n: int

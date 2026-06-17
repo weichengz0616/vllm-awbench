@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
-from fastapi import APIRouter, FastAPI, Query, Request
+from typing import Any
+
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 
 import vllm.envs as envs
@@ -44,6 +46,36 @@ async def reset_prefix_cache(
     return Response(status_code=200)
 
 
+@router.post("/finish_program")
+async def finish_program(
+    raw_request: Request,
+    payload: dict[str, Any] = Body(...),
+):
+    """Notify cache policies that a program has finished."""
+    workflow_id = payload.get("workflow_id") or payload.get("template_id")
+    program_id = payload.get("program_id")
+    if (
+        not isinstance(workflow_id, str)
+        or not workflow_id
+        or not isinstance(program_id, str)
+        or not program_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_id/template_id and program_id are required",
+        )
+
+    logger.info(
+        "Finishing program: workflow_id=%s program_id=%s",
+        workflow_id,
+        program_id,
+    )
+    cleared_contributions = await engine_client(raw_request).finish_program(
+        workflow_id, program_id
+    )
+    return {"cleared_contributions": cleared_contributions}
+
+
 @router.post("/reset_mm_cache")
 async def reset_mm_cache(raw_request: Request):
     """
@@ -67,6 +99,6 @@ async def reset_encoder_cache(raw_request: Request):
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
+    # if not envs.VLLM_SERVER_DEV_MODE:
+    #     return
     app.include_router(router)

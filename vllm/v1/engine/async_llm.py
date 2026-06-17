@@ -936,6 +936,9 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return await self.engine_core.finish_program_async(workflow_id, program_id)
+
     async def sleep(self, level: int = 1) -> None:
         await self.reset_prefix_cache()
         await self.engine_core.sleep_async(level)

@@ -55,7 +55,8 @@ class KVBlockPolicyMetadata:
 class KVRequestPolicyMetadata:
     # Common agent/workflow identifiers.
     # workflow_id identifies the workflow template; program_id identifies a
-    # concrete workflow instance.
+    # concrete workflow instance. External requests may pass template_id as an
+    # alias for workflow_id.
     workflow_id: str | None = None
     program_id: str | None = None
     program_type: ProgramType | None = None
@@ -101,7 +102,8 @@ class KVRequestPolicyMetadata:
             program_type = program_type.lower()
 
         return cls(
-            workflow_id=_as_str(raw.get("workflow_id")),
+            workflow_id=_as_str(raw.get("template_id"))
+            or _as_str(raw.get("workflow_id")),
             program_id=_as_str(raw.get("program_id")),
             program_type=program_type if program_type in ("dag", "react") else None,
             agent_id=_as_str(raw.get("agent_id")),
@@ -163,6 +165,18 @@ class RequestMetadataContext:
     iter_block_metadata: Callable[[], Iterable[KVBlockPolicyMetadata]]
 
 
+@dataclass
+class ProgramMetadataContext:
+    workflow_id: str
+    program_id: str
+    metadata_for_block: Callable[[KVCacheBlock], KVBlockPolicyMetadata]
+    get_agent_live_blocks: Callable[
+        [str, str],
+        dict[BlockHashWithGroupId, list[KVCacheBlock]],
+    ]
+    iter_block_metadata: Callable[[], Iterable[KVBlockPolicyMetadata]]
+
+
 class EvictionContextProvider(Protocol):
     def __call__(self) -> EvictionContext: ...
 
@@ -193,10 +207,21 @@ class BaseEvictionPolicy(FreeBlockEvictionPolicy):
     def on_request_metadata(self, context: RequestMetadataContext) -> None:
         return
 
+    def on_program_finished(self, context: ProgramMetadataContext) -> int:
+        return 0
+
     def on_block_metadata_bound(
         self,
         context: RequestMetadataContext,
         block: KVCacheBlock,
+    ) -> None:
+        return
+
+    def on_cached_block_metadata_hit(
+        self,
+        context: RequestMetadataContext,
+        block: KVCacheBlock,
+        prompt_part: PromptPart,
     ) -> None:
         return
 
@@ -294,6 +319,27 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
                 step,
             )
 
+    def on_cached_block_metadata_hit(
+        self,
+        context: RequestMetadataContext,
+        block: KVCacheBlock,
+        prompt_part: PromptPart,
+    ) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        step = req_metadata.step_for_agent(req_metadata.agent_id)
+        if (
+            prompt_part == "fixed"
+            and req_metadata.program_id is not None
+            and req_metadata.agent_id is not None
+            and step is not None
+        ):
+            self._set_step_contribution(
+                context.metadata_for_block(block),
+                req_metadata.program_id,
+                req_metadata.agent_id,
+                step,
+            )
+
     def on_request_metadata(self, context: RequestMetadataContext) -> None:
         req_metadata = context.request.kv_cache_policy_metadata
         workflow_id = req_metadata.workflow_key
@@ -302,9 +348,15 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
             return
 
         if req_metadata.is_program_last_step:
-            for metadata in context.iter_block_metadata():
-                if metadata.workflow_id == workflow_id:
-                    self._remove_program_contributions(metadata, program_id)
+            self.on_program_finished(
+                ProgramMetadataContext(
+                    workflow_id=workflow_id,
+                    program_id=program_id,
+                    metadata_for_block=context.metadata_for_block,
+                    get_agent_live_blocks=context.get_agent_live_blocks,
+                    iter_block_metadata=context.iter_block_metadata,
+                )
+            )
             return
 
         agent_steps = req_metadata.agent_steps_to_execution
@@ -325,6 +377,16 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
                         agent_id,
                         step,
                     )
+
+    def on_program_finished(self, context: ProgramMetadataContext) -> int:
+        removed = 0
+        for metadata in context.iter_block_metadata():
+            if metadata.workflow_id != context.workflow_id:
+                continue
+            before = len(metadata.step_contributions)
+            self._remove_program_contributions(metadata, context.program_id)
+            removed += before - len(metadata.step_contributions)
+        return removed
 
     def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
         ctx = self.context_provider()

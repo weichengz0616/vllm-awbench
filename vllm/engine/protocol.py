@@ -138,6 +138,11 @@ class EngineClient(ABC):
         ...
 
     @abstractmethod
+    async def finish_program(self, workflow_id: str, program_id: str) -> int:
+        """Notify cache policies that a program has finished."""
+        ...
+
+    @abstractmethod
     async def sleep(self, level: int = 1) -> None:
         """Sleep the engine"""
         ...

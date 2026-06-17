@@ -16,6 +16,7 @@ from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
     EvictionContext,
     KVBlockPolicyMetadata,
+    ProgramMetadataContext,
     RequestMetadataContext,
     get_prompt_part,
     make_free_block_eviction_policy,
@@ -249,6 +250,17 @@ class BlockPool:
             )
         )
 
+    def finish_program(self, workflow_id: str, program_id: str) -> int:
+        return self.free_block_queue.eviction_policy.on_program_finished(
+            ProgramMetadataContext(
+                workflow_id=workflow_id,
+                program_id=program_id,
+                metadata_for_block=self.get_block_metadata,
+                get_agent_live_blocks=self.get_agent_live_blocks,
+                iter_block_metadata=lambda: iter(self.block_metadata),
+            )
+        )
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -424,6 +436,9 @@ class BlockPool:
             block_size,
             req_metadata.fixed_prefix_len,
             request.num_prompt_tokens,
+        )
+        metadata.steps_to_execution = req_metadata.step_for_agent(
+            req_metadata.agent_id
         )
         metadata.critical = req_metadata.critical
         metadata.status = "gpu"
@@ -617,6 +632,45 @@ class BlockPool:
             )
         return True
 
+    def record_cached_block_hit_metadata(
+        self,
+        block: KVCacheBlock,
+        request: Request,
+        block_index: int,
+        block_size: int,
+    ) -> None:
+        req_metadata = request.kv_cache_policy_metadata
+        workflow_id = req_metadata.workflow_key
+        agent_id = req_metadata.agent_id
+        prompt_part = get_prompt_part(
+            block_index,
+            block_size,
+            req_metadata.fixed_prefix_len,
+            request.num_prompt_tokens,
+        )
+        if (
+            block.is_null
+            or block.block_hash is None
+            or workflow_id is None
+            or agent_id is None
+            or prompt_part != "fixed"
+        ):
+            return
+
+        self.free_block_queue.eviction_policy.on_cached_block_metadata_hit(
+            RequestMetadataContext(
+                request=request,
+                metadata_for_block=self.get_block_metadata,
+                get_agent_live_blocks=self.get_agent_live_blocks,
+                iter_block_metadata=lambda: iter(self.block_metadata),
+            ),
+            block,
+            prompt_part,
+        )
+        self._record_agent_live_block(
+            workflow_id, agent_id, block, block.block_hash
+        )
+
     def _maybe_record_agent_live_block(
         self, block: KVCacheBlock, block_hash: BlockHashWithGroupId
     ) -> None:
@@ -627,16 +681,26 @@ class BlockPool:
             or metadata.prompt_part != "fixed"
         ):
             return
+        self._record_agent_live_block(
+            metadata.workflow_id, metadata.agent_id, block, block_hash
+        )
 
-        agent_key = (metadata.workflow_id, metadata.agent_id)
+    def _record_agent_live_block(
+        self,
+        workflow_id: str,
+        agent_id: str,
+        block: KVCacheBlock,
+        block_hash: BlockHashWithGroupId,
+    ) -> None:
+        agent_key = (workflow_id, agent_id)
         blocks_by_hash = self._agent_live_blocks.setdefault(agent_key, {})
         blocks_by_id = blocks_by_hash.setdefault(block_hash, {})
         blocks_by_id[block.block_id] = block
         logger.info(
             "awbench ---- Recorded live agent KV block: workflow_id=%s agent_id=%s "
             "block_id=%d block_hash=%s",
-            metadata.workflow_id,
-            metadata.agent_id,
+            workflow_id,
+            agent_id,
             block.block_id,
             block_hash,
         )
@@ -644,34 +708,25 @@ class BlockPool:
     def _maybe_remove_agent_live_block(
         self, block: KVCacheBlock, block_hash: BlockHashWithGroupId
     ) -> None:
-        metadata = self.block_metadata[block.block_id]
-        if (
-            metadata.workflow_id is None
-            or metadata.agent_id is None
-            or metadata.prompt_part != "fixed"
-        ):
-            return
-
-        agent_key = (metadata.workflow_id, metadata.agent_id)
-        blocks_by_hash = self._agent_live_blocks.get(agent_key)
-        if blocks_by_hash is None:
-            return
-        blocks_by_id = blocks_by_hash.get(block_hash)
-        if blocks_by_id is None:
-            return
-        blocks_by_id.pop(block.block_id, None)
-        logger.info(
-            "awbench ---- Removed live agent KV block: workflow_id=%s agent_id=%s "
-            "block_id=%d block_hash=%s",
-            metadata.workflow_id,
-            metadata.agent_id,
-            block.block_id,
-            block_hash,
-        )
-        if not blocks_by_id:
-            blocks_by_hash.pop(block_hash, None)
-        if not blocks_by_hash:
-            self._agent_live_blocks.pop(agent_key, None)
+        for agent_key, blocks_by_hash in list(self._agent_live_blocks.items()):
+            blocks_by_id = blocks_by_hash.get(block_hash)
+            if blocks_by_id is None:
+                continue
+            if block.block_id not in blocks_by_id:
+                continue
+            blocks_by_id.pop(block.block_id, None)
+            logger.info(
+                "awbench ---- Removed live agent KV block: workflow_id=%s "
+                "agent_id=%s block_id=%d block_hash=%s",
+                agent_key[0],
+                agent_key[1],
+                block.block_id,
+                block_hash,
+            )
+            if not blocks_by_id:
+                blocks_by_hash.pop(block_hash, None)
+            if not blocks_by_hash:
+                self._agent_live_blocks.pop(agent_key, None)
 
     def get_agent_live_blocks(
         self,

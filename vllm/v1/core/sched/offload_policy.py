@@ -549,9 +549,10 @@ class KVFlowOffloadPolicy(BaseAgentOffloadPolicy):
             if allocated_blocks is None:
                 continue
             gpu_block_ids = allocated_blocks.get_block_ids()[0]
+            prefetch_req_id = allocated_blocks.request_id or PREFETCH_POOL_REQ_ID
             block_ranges.append(
                 KVBlockRange(
-                    req_id=PREFETCH_POOL_REQ_ID,
+                    req_id=prefetch_req_id,
                     start_block_idx=0,
                     num_blocks=len(block_hashes_to_load),
                     block_hashes=block_hashes_to_load,
@@ -562,7 +563,9 @@ class KVFlowOffloadPolicy(BaseAgentOffloadPolicy):
             )
             logger.info(
                 "awbench ---- KVFlow planned fixed-prefix KV prefetch: "
-                "workflow_id=%s agent_id=%s num_blocks=%d gpu_block_ids=%s",
+                "request_id=%s workflow_id=%s agent_id=%s num_blocks=%d "
+                "gpu_block_ids=%s",
+                prefetch_req_id,
                 workflow_id,
                 agent_id,
                 len(block_hashes_to_load),
@@ -600,24 +603,28 @@ class KVFlowOffloadPolicy(BaseAgentOffloadPolicy):
 
         block_ranges.sort(key=load_priority)
 
+        default_block_ranges = list(default_plan.block_ranges)
         seen = {
             (block_range.req_id, block_range.start_block_idx, block_range.num_blocks)
-            for block_range in block_ranges
+            for block_range in default_block_ranges
         }
-        for block_range in default_plan.block_ranges:
+        deduped_prefetch_ranges = []
+        for block_range in block_ranges:
             key = (
                 block_range.req_id,
                 block_range.start_block_idx,
                 block_range.num_blocks,
             )
-            if key not in seen:
-                block_ranges.append(block_range)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped_prefetch_ranges.append(block_range)
 
         return KVLoadPlan(
             handled=True,
             num_external_tokens=0,
             load_async=True,
-            block_ranges=block_ranges,
+            block_ranges=default_block_ranges + deduped_prefetch_ranges,
         )
 
     def get_offload_plan(self, context: OffloadDecisionContext) -> KVOffloadPlan:
