@@ -175,7 +175,7 @@ def test_request_policy_metadata_binds_to_blocks():
                     "program_id": "p0",
                     "agent_id": "a0",
                     "fixed_prefix_len": 2,
-                    "steps_to_execution": 3,
+                    "agent_steps_to_execution": {"a0": 3},
                     "critical": True,
                 }
             }
@@ -225,6 +225,43 @@ def test_request_policy_metadata_accepts_external_template_id():
 
     assert metadata.workflow_id == "legacy-template"
     assert metadata.workflow_key == "legacy-template"
+
+
+def test_request_policy_metadata_accepts_agent_next_call_distance():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "awbench_meta": {
+                "workflow_id": "wf0",
+                "agent_next_call_distance": {
+                    "agent-a": 0,
+                    "agent-b": 1,
+                    "agent-c": 2,
+                },
+            }
+        }
+    )
+
+    assert metadata.agent_steps_to_execution == {
+        "agent-a": 0.0,
+        "agent-b": 1.0,
+        "agent-c": 2.0,
+    }
+    assert metadata.next_agent_ids == ["agent-b"]
+
+
+def test_request_policy_metadata_explicit_next_agent_ids_win():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "awbench_meta": {
+                "workflow_id": "wf0",
+                "agent_next_call_distance": {"agent-b": 1},
+                "next_agent_ids": ["agent-c"],
+            }
+        }
+    )
+
+    assert metadata.agent_steps_to_execution == {"agent-b": 1.0}
+    assert metadata.next_agent_ids == ["agent-c"]
 
 
 def test_agent_fixed_hashes_are_keyed_by_workflow_agent():
@@ -306,7 +343,7 @@ def test_agent_live_blocks_survive_free_and_are_removed_on_eviction():
     assert pool.get_agent_live_blocks("wf0", "a0") == {}
 
 
-def test_cached_fixed_hit_registers_shared_agent_contribution():
+def test_cached_fixed_hit_uses_shared_agent_min_step():
     pool = BlockPool(
         num_gpu_blocks=4,
         enable_caching=True,
@@ -319,7 +356,7 @@ def test_cached_fixed_hit_registers_shared_agent_contribution():
             program_id="p0",
             agent_id="agent_a",
             fixed_prefix_len=2,
-            steps_to_execution=5,
+            agent_steps_to_execution={"agent_a": 5},
         ),
         block_hashes=[b"shared"],
     )
@@ -340,7 +377,7 @@ def test_cached_fixed_hit_registers_shared_agent_contribution():
             program_id="p1",
             agent_id="agent_b",
             fixed_prefix_len=2,
-            steps_to_execution=1,
+            agent_steps_to_execution={"agent_a": 5, "agent_b": 1},
         ),
         request_id="r1",
         block_hashes=[b"shared"],
@@ -357,10 +394,6 @@ def test_cached_fixed_hit_registers_shared_agent_contribution():
 
     assert pool.get_agent_live_blocks("wf0", "agent_a")[block_hash] == [block]
     assert pool.get_agent_live_blocks("wf0", "agent_b")[block_hash] == [block]
-    assert metadata.step_contributions == {
-        ("p0", "agent_a"): 5,
-        ("p1", "agent_b"): 1,
-    }
     assert metadata.steps_to_execution == 1
 
     assert pool._maybe_evict_cached_block(block)
@@ -368,7 +401,7 @@ def test_cached_fixed_hit_registers_shared_agent_contribution():
     assert pool.get_agent_live_blocks("wf0", "agent_b") == {}
 
 
-def test_kvflow_program_contributions_update_live_fixed_blocks():
+def test_kvflow_request_graph_overwrites_live_fixed_block_steps():
     pool = BlockPool(
         num_gpu_blocks=3,
         enable_caching=True,
@@ -415,20 +448,18 @@ def test_kvflow_program_contributions_update_live_fixed_blocks():
     )
 
     metadata = pool.get_block_metadata(block)
-    assert metadata.step_contributions == {("p0", "a0"): 4, ("p1", "a0"): 1}
     assert metadata.steps_to_execution == 1
 
     pool.on_request_metadata(
         DummyRequest(
             KVRequestPolicyMetadata(
                 workflow_id="wf0",
-                program_id="p1",
-                is_program_last_step=True,
+                program_id="p2",
+                agent_steps_to_execution={"a0": 4},
             )
         )
     )
 
-    assert metadata.step_contributions == {("p0", "a0"): 4}
     assert metadata.steps_to_execution == 4
 
 
@@ -440,7 +471,7 @@ def test_kvflow_offload_policy_stores_fixed_prefix_only():
             program_id="p0",
             agent_id="a0",
             fixed_prefix_len=4,
-            steps_to_execution=1,
+            agent_steps_to_execution={"a0": 1},
         ),
         request_id="r0",
         num_computed_tokens=0,

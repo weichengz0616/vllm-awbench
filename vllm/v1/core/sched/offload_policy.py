@@ -1096,8 +1096,6 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         session_key = self._request_session_keys.pop(request.request_id, None)
         if session_key is None:
             return
-        if not metadata.is_program_last_step:
-            return
         program = self._programs.get(session_key[0])
         if program is None:
             return

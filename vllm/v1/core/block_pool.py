@@ -448,7 +448,7 @@ class BlockPool:
             logger.info(
                 "awbench ---- Bound KV block metadata: block_id=%d request_id=%s "
                 "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s "
-                "steps_to_execution=%s contributions=%d critical=%s pool_class=%s",
+                "steps_to_execution=%s critical=%s pool_class=%s",
                 block.block_id,
                 request.request_id,
                 metadata.workflow_id,
@@ -456,7 +456,6 @@ class BlockPool:
                 metadata.agent_id,
                 metadata.prompt_part,
                 metadata.steps_to_execution,
-                len(metadata.step_contributions),
                 metadata.critical,
                 metadata.pool_class,
             )

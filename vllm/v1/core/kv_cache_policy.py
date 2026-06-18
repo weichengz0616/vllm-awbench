@@ -31,7 +31,6 @@ class KVBlockPolicyMetadata:
     program_id: str | None = None
     agent_id: str | None = None
     prompt_part: PromptPart = "output"
-    step_contributions: dict[tuple[str, str], float] = field(default_factory=dict)
     steps_to_execution: float | None = None
     ttl_deadline: float | None = None
     critical: bool = False
@@ -43,7 +42,6 @@ class KVBlockPolicyMetadata:
         self.program_id = None
         self.agent_id = None
         self.prompt_part = "output"
-        self.step_contributions.clear()
         self.steps_to_execution = None
         self.ttl_deadline = None
         self.critical = False
@@ -64,13 +62,11 @@ class KVRequestPolicyMetadata:
     fixed_prefix_len: int | None = None
 
     # KVFlow-specific metadata.
-    steps_to_execution: float | None = None
     agent_steps_to_execution: dict[str, float] = field(default_factory=dict)
     next_agent_ids: list[str] = field(default_factory=list)
 
     # CacheTTL / Tokencake metadata.
     ttl_seconds: float | None = None
-    is_program_last_step: bool = False
     critical: bool = False
 
     # Offload / tool-call metadata.
@@ -89,10 +85,22 @@ class KVRequestPolicyMetadata:
         raw = extra_args.get("awbench_meta")
         if not isinstance(raw, dict):
             return cls()
-        steps_by_agent = raw.get("agent_steps_to_execution") or {}
+        steps_by_agent = (
+            raw.get("agent_steps_to_execution")
+            or raw.get("agent_next_call_distance")
+            or {}
+        )
         if not isinstance(steps_by_agent, dict):
             steps_by_agent = {}
-        next_agent_ids = raw.get("next_agent_ids") or raw.get("next_agents") or []
+        next_agent_ids = raw.get("next_agent_ids")
+        if next_agent_ids is None:
+            next_agent_ids = raw.get("next_agents")
+        if next_agent_ids is None:
+            next_agent_ids = [
+                agent_id
+                for agent_id, distance in steps_by_agent.items()
+                if _is_number(distance) and float(distance) == 1
+            ]
         if isinstance(next_agent_ids, str):
             next_agent_ids = [next_agent_ids]
         if not isinstance(next_agent_ids, list):
@@ -108,7 +116,6 @@ class KVRequestPolicyMetadata:
             program_type=program_type if program_type in ("dag", "react") else None,
             agent_id=_as_str(raw.get("agent_id")),
             fixed_prefix_len=_as_int(raw.get("fixed_prefix_len")),
-            steps_to_execution=_as_float(raw.get("steps_to_execution")),
             agent_steps_to_execution={
                 str(k): float(v)
                 for k, v in steps_by_agent.items()
@@ -116,7 +123,6 @@ class KVRequestPolicyMetadata:
             },
             next_agent_ids=[str(agent_id) for agent_id in next_agent_ids],
             ttl_seconds=_as_float(raw.get("ttl_seconds")),
-            is_program_last_step=bool(raw.get("is_program_last_step", False)),
             critical=bool(raw.get("critical", False)),
             session_id=_as_str(raw.get("session_id")),
             predicted_tool_time=_as_float(
@@ -136,9 +142,9 @@ class KVRequestPolicyMetadata:
         )
 
     def step_for_agent(self, agent_id: str | None) -> float | None:
-        if agent_id is not None and agent_id in self.agent_steps_to_execution:
-            return self.agent_steps_to_execution[agent_id]
-        return self.steps_to_execution
+        if agent_id is None:
+            return None
+        return self.agent_steps_to_execution.get(agent_id)
 
     @property
     def workflow_key(self) -> str | None:
@@ -256,32 +262,41 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
     policy_name: AgentKVEvictionPolicy = "kvflow"
 
     @staticmethod
-    def _set_step_contribution(
-        metadata: KVBlockPolicyMetadata,
-        program_id: str,
-        agent_id: str,
-        step: float,
+    def _set_steps_to_execution(
+        metadata: KVBlockPolicyMetadata, step: float | None
     ) -> None:
-        metadata.step_contributions[(program_id, agent_id)] = step
-        KVFlowEvictionPolicy._refresh_steps_to_execution(metadata)
+        metadata.steps_to_execution = step
 
-    @staticmethod
-    def _remove_program_contributions(
-        metadata: KVBlockPolicyMetadata,
-        program_id: str,
-    ) -> None:
-        for key in list(metadata.step_contributions):
-            if key[0] == program_id:
-                del metadata.step_contributions[key]
-        KVFlowEvictionPolicy._refresh_steps_to_execution(metadata)
+    def _step_for_block_agents(
+        self,
+        context: RequestMetadataContext,
+        workflow_id: str,
+        block: KVCacheBlock,
+        fallback_agent_id: str | None = None,
+    ) -> float | None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        steps = []
+        seen_agent_ids = set()
 
-    @staticmethod
-    def _refresh_steps_to_execution(metadata: KVBlockPolicyMetadata) -> None:
-        metadata.steps_to_execution = (
-            min(metadata.step_contributions.values())
-            if metadata.step_contributions
-            else None
-        )
+        block_hash = block.block_hash
+        if block_hash is not None:
+            for agent_id in req_metadata.agent_steps_to_execution:
+                if agent_id in seen_agent_ids:
+                    continue
+                live_blocks = context.get_agent_live_blocks(workflow_id, agent_id)
+                if any(
+                    candidate.block_id == block.block_id
+                    for candidate in live_blocks.get(block_hash, ())
+                ):
+                    steps.append(req_metadata.agent_steps_to_execution[agent_id])
+                    seen_agent_ids.add(agent_id)
+
+        if fallback_agent_id is not None and fallback_agent_id not in seen_agent_ids:
+            step = req_metadata.step_for_agent(fallback_agent_id)
+            if step is not None:
+                steps.append(step)
+
+        return min(steps) if steps else None
 
     def on_block_metadata_bound(
         self,
@@ -290,19 +305,14 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
     ) -> None:
         req_metadata = context.request.kv_cache_policy_metadata
         metadata = context.metadata_for_block(block)
-        step = req_metadata.step_for_agent(req_metadata.agent_id)
-        if (
-            metadata.prompt_part == "fixed"
-            and req_metadata.program_id is not None
-            and req_metadata.agent_id is not None
-            and step is not None
-        ):
-            self._set_step_contribution(
-                metadata,
-                req_metadata.program_id,
-                req_metadata.agent_id,
-                step,
-            )
+        workflow_id = req_metadata.workflow_key
+        if metadata.prompt_part != "fixed" or workflow_id is None:
+            return
+        step = self._step_for_block_agents(
+            context, workflow_id, block, req_metadata.agent_id
+        )
+        if step is not None:
+            self._set_steps_to_execution(metadata, step)
 
     def on_cached_block_metadata_hit(
         self,
@@ -311,51 +321,36 @@ class KVFlowEvictionPolicy(BaseEvictionPolicy):
         prompt_part: PromptPart,
     ) -> None:
         req_metadata = context.request.kv_cache_policy_metadata
-        step = req_metadata.step_for_agent(req_metadata.agent_id)
-        if (
-            prompt_part == "fixed"
-            and req_metadata.program_id is not None
-            and req_metadata.agent_id is not None
-            and step is not None
-        ):
-            self._set_step_contribution(
-                context.metadata_for_block(block),
-                req_metadata.program_id,
-                req_metadata.agent_id,
-                step,
-            )
+        workflow_id = req_metadata.workflow_key
+        if prompt_part != "fixed" or workflow_id is None:
+            return
+        step = self._step_for_block_agents(
+            context, workflow_id, block, req_metadata.agent_id
+        )
+        if step is not None:
+            self._set_steps_to_execution(context.metadata_for_block(block), step)
 
     def on_request_metadata(self, context: RequestMetadataContext) -> None:
         req_metadata = context.request.kv_cache_policy_metadata
         workflow_id = req_metadata.workflow_key
-        program_id = req_metadata.program_id
-        if workflow_id is None or program_id is None:
-            return
-
-        if req_metadata.is_program_last_step:
-            for metadata in context.iter_block_metadata():
-                if metadata.workflow_id == workflow_id:
-                    self._remove_program_contributions(metadata, program_id)
+        if workflow_id is None:
             return
 
         agent_steps = req_metadata.agent_steps_to_execution
-        if (
-            not agent_steps
-            and req_metadata.agent_id is not None
-            and req_metadata.steps_to_execution is not None
-        ):
-            agent_steps = {req_metadata.agent_id: req_metadata.steps_to_execution}
+        if not agent_steps:
+            return
 
+        block_steps: dict[int, tuple[KVCacheBlock, float]] = {}
         for agent_id, step in agent_steps.items():
             blocks_by_hash = context.get_agent_live_blocks(workflow_id, agent_id)
             for blocks in blocks_by_hash.values():
                 for block in blocks:
-                    self._set_step_contribution(
-                        context.metadata_for_block(block),
-                        program_id,
-                        agent_id,
-                        step,
-                    )
+                    current = block_steps.get(block.block_id)
+                    if current is None or step < current[1]:
+                        block_steps[block.block_id] = (block, step)
+
+        for block, step in block_steps.values():
+            self._set_steps_to_execution(context.metadata_for_block(block), step)
 
     def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
         ctx = self.context_provider()
@@ -425,8 +420,6 @@ def align_fixed_prefix_len(
 
 
 def ttl_deadline(now: float, request_metadata: KVRequestPolicyMetadata) -> float | None:
-    if request_metadata.is_program_last_step:
-        return None
     ttl_seconds = request_metadata.ttl_seconds
     if ttl_seconds is None or ttl_seconds <= 0:
         return None

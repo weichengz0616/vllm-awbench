@@ -55,7 +55,7 @@ def test_awbench_request_meta_binds_during_real_schedule_factor_one():
                     "program_id": "p0",
                     "agent_id": "a0",
                     "fixed_prefix_len": 16,
-                    "steps_to_execution": 7,
+                    "agent_steps_to_execution": {"a0": 7},
                     "critical": True,
                 }
             },
