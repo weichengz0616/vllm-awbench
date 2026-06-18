@@ -16,7 +16,6 @@ from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
     EvictionContext,
     KVBlockPolicyMetadata,
-    ProgramMetadataContext,
     RequestMetadataContext,
     get_prompt_part,
     make_free_block_eviction_policy,
@@ -244,17 +243,6 @@ class BlockPool:
         self.free_block_queue.eviction_policy.on_request_metadata(
             RequestMetadataContext(
                 request=request,
-                metadata_for_block=self.get_block_metadata,
-                get_agent_live_blocks=self.get_agent_live_blocks,
-                iter_block_metadata=lambda: iter(self.block_metadata),
-            )
-        )
-
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        return self.free_block_queue.eviction_policy.on_program_finished(
-            ProgramMetadataContext(
-                workflow_id=workflow_id,
-                program_id=program_id,
                 metadata_for_block=self.get_block_metadata,
                 get_agent_live_blocks=self.get_agent_live_blocks,
                 iter_block_metadata=lambda: iter(self.block_metadata),

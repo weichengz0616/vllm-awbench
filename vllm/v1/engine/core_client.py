@@ -149,9 +149,6 @@ class EngineCoreClient(ABC):
     def reset_encoder_cache(self) -> None:
         raise NotImplementedError
 
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        raise NotImplementedError
-
     def sleep(self, level: int = 1) -> None:
         raise NotImplementedError
 
@@ -225,9 +222,6 @@ class EngineCoreClient(ABC):
         raise NotImplementedError
 
     async def reset_encoder_cache_async(self) -> None:
-        raise NotImplementedError
-
-    async def finish_program_async(self, workflow_id: str, program_id: str) -> int:
         raise NotImplementedError
 
     async def sleep_async(self, level: int = 1) -> None:
@@ -316,9 +310,6 @@ class InprocClient(EngineCoreClient):
 
     def reset_encoder_cache(self) -> None:
         self.engine_core.reset_encoder_cache()
-
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        return self.engine_core.finish_program(workflow_id, program_id)
 
     def sleep(self, level: int = 1) -> None:
         self.engine_core.sleep(level)
@@ -789,9 +780,6 @@ class SyncMPClient(MPClient):
     def reset_encoder_cache(self) -> None:
         self.call_utility("reset_encoder_cache")
 
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        return self.call_utility("finish_program", workflow_id, program_id)
-
     def add_lora(self, lora_request: LoRARequest) -> bool:
         return self.call_utility("add_lora", lora_request)
 
@@ -1013,11 +1001,6 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
-
-    async def finish_program_async(self, workflow_id: str, program_id: str) -> int:
-        return await self.call_utility_async(
-            "finish_program", workflow_id, program_id
-        )
 
     async def sleep_async(self, level: int = 1) -> None:
         await self.call_utility_async("sleep", level)

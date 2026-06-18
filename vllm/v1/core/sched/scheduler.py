@@ -1937,9 +1937,6 @@ class Scheduler(SchedulerInterface):
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0
 
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        return self.kv_cache_manager.finish_program(workflow_id, program_id)
-
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:

@@ -433,55 +433,6 @@ def test_kvflow_program_contributions_update_live_fixed_blocks():
 
 
 
-def test_finish_program_clears_kvflow_program_contributions():
-    pool = BlockPool(
-        num_gpu_blocks=4,
-        enable_caching=False,
-        hash_block_size=2,
-        eviction_policy="kvflow",
-    )
-    metadata = pool.block_metadata[1]
-    metadata.workflow_id = "wf0"
-    metadata.prompt_part = "fixed"
-    metadata.step_contributions = {
-        ("p0", "a0"): 4,
-        ("p1", "a0"): 1,
-    }
-    metadata.steps_to_execution = 1
-
-    other_workflow = pool.block_metadata[2]
-    other_workflow.workflow_id = "wf1"
-    other_workflow.prompt_part = "fixed"
-    other_workflow.step_contributions = {("p1", "a0"): 0}
-    other_workflow.steps_to_execution = 0
-
-    removed = pool.finish_program("wf0", "p1")
-
-    assert removed == 1
-    assert metadata.step_contributions == {("p0", "a0"): 4}
-    assert metadata.steps_to_execution == 4
-    assert other_workflow.step_contributions == {("p1", "a0"): 0}
-    assert other_workflow.steps_to_execution == 0
-
-
-def test_finish_program_is_noop_for_non_kvflow_policy():
-    pool = BlockPool(
-        num_gpu_blocks=3,
-        enable_caching=False,
-        hash_block_size=2,
-        eviction_policy="cachettl",
-    )
-    metadata = pool.block_metadata[1]
-    metadata.workflow_id = "wf0"
-    metadata.step_contributions = {("p0", "a0"): 1}
-    metadata.steps_to_execution = 1
-
-    removed = pool.finish_program("wf0", "p0")
-
-    assert removed == 0
-    assert metadata.step_contributions == {("p0", "a0"): 1}
-    assert metadata.steps_to_execution == 1
-
 def test_kvflow_offload_policy_stores_fixed_prefix_only():
     policy = KVFlowOffloadPolicy()
     req = DummyRequest(

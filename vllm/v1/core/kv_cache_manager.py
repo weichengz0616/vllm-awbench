@@ -214,9 +214,6 @@ class KVCacheManager:
     def on_request_metadata(self, request: Request) -> None:
         self.block_pool.on_request_metadata(request)
 
-    def finish_program(self, workflow_id: str, program_id: str) -> int:
-        return self.block_pool.finish_program(workflow_id, program_id)
-
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
