@@ -1348,6 +1348,7 @@ class OpenAIServingChat(OpenAIServing):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
+                    num_kvcache_hit_tokens=num_cached_tokens or 0,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1747,6 +1748,7 @@ class OpenAIServingChat(OpenAIServing):
             prompt_token_ids=(
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
+            num_kvcache_hit_tokens=final_res.num_cached_tokens or 0,
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
