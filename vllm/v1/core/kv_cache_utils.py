@@ -4,7 +4,6 @@
 
 import copy
 import os
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
@@ -154,67 +153,6 @@ class KVCacheBlock:
         )
 
 
-class FreeBlockEvictionPolicy(ABC):
-    """Policy for ordering free KV cache blocks for future eviction.
-
-    `FreeKVCacheBlockQueue` owns the linked-list mechanics; the policy owns
-    the eviction semantics: which block is selected next, and where newly
-    freed blocks are inserted.
-    """
-
-    def order_initial_blocks(
-        self, blocks: Sequence[KVCacheBlock]
-    ) -> Sequence[KVCacheBlock]:
-        """Return the initial queue order."""
-        return blocks
-
-    def on_request_metadata(self, context: Any) -> None:
-        """Update block metadata from a request.
-
-        Most policies do not need request-driven metadata updates. Policies
-        that do, such as KVFlow, can override this hook.
-        """
-        return
-
-    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
-        """Update metadata after a newly allocated block is bound to a request."""
-        return
-
-    def on_cached_block_metadata_hit(
-        self, context: Any, block: KVCacheBlock, prompt_part: Any
-    ) -> None:
-        """Update metadata when an existing cached block is reused."""
-        return
-
-    @abstractmethod
-    def select_victims(
-        self, queue: "FreeKVCacheBlockQueue", n: int
-    ) -> list[KVCacheBlock]:
-        """Remove and return the next `n` blocks to allocate/evict."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def insert_free_blocks(
-        self, queue: "FreeKVCacheBlockQueue", blocks: list[KVCacheBlock]
-    ) -> None:
-        """Insert newly freed blocks into the queue."""
-        raise NotImplementedError
-
-
-class LRUEvictionPolicy(FreeBlockEvictionPolicy):
-    """Default policy: evict the least-recently freed/accessed block first."""
-
-    def select_victims(
-        self, queue: "FreeKVCacheBlockQueue", n: int
-    ) -> list[KVCacheBlock]:
-        return queue._popleft_n(n)
-
-    def insert_free_blocks(
-        self, queue: "FreeKVCacheBlockQueue", blocks: list[KVCacheBlock]
-    ) -> None:
-        queue._append_tail_n(blocks)
-
-
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -235,17 +173,12 @@ class FreeKVCacheBlockQueue:
 
     Args:
         blocks: A list of KVCacheBlock objects.
-        eviction_policy: Policy controlling victim selection and insertion
-            order. Defaults to LRU.
     """
 
     def __init__(
         self,
         blocks: list[KVCacheBlock],
-        eviction_policy: FreeBlockEvictionPolicy | None = None,
     ) -> None:
-        self.eviction_policy = eviction_policy or LRUEvictionPolicy()
-        blocks = list(self.eviction_policy.order_initial_blocks(blocks))
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -275,6 +208,17 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+    def on_request_metadata(self, context: Any) -> None:
+        return
+
+    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
+        return
+
+    def on_cached_block_metadata_hit(
+        self, context: Any, block: KVCacheBlock, prompt_part: Any
+    ) -> None:
+        return
+
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
 
@@ -283,7 +227,7 @@ class FreeKVCacheBlockQueue:
         """
         if self.num_free_blocks == 0:
             raise ValueError("No free blocks available")
-        return self.eviction_policy.select_victims(self, 1)[0]
+        return self._popleft()
 
     def _popleft(self) -> KVCacheBlock:
         """Remove the physical head of the linked list."""
@@ -332,7 +276,7 @@ class FreeKVCacheBlockQueue:
         if n == 0:
             return []
         assert self.num_free_blocks >= n
-        return self.eviction_policy.select_victims(self, n)
+        return self._popleft_n(n)
 
     def _popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Remove the first n blocks from the physical linked-list head."""
@@ -387,7 +331,7 @@ class FreeKVCacheBlockQueue:
         Args:
             block: The block to append.
         """
-        self.eviction_policy.insert_free_blocks(self, [block])
+        self._append_tail_n([block])
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
         """Put a list of blocks back into the free list
@@ -395,7 +339,7 @@ class FreeKVCacheBlockQueue:
         Args:
             blocks: The blocks to append.
         """
-        self.eviction_policy.insert_free_blocks(self, blocks)
+        self._append_tail_n(blocks)
 
     def _append_tail_n(self, blocks: list[KVCacheBlock]) -> None:
         """Insert blocks at the physical linked-list tail."""
@@ -436,6 +380,251 @@ class FreeKVCacheBlockQueue:
             ret.append(curr_block)
             curr_block = curr_block.next_free_block
         return ret
+
+
+class KVFlowFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
+    """Bucketed free-block queue for KVFlow eviction.
+
+    Allocation remains cheap: pop from the first non-empty bucket. Metadata
+    changes move only the affected free blocks between buckets.
+    """
+
+    _BUCKET_UNCACHED = "uncached"
+    _BUCKET_DYNAMIC = "dynamic_output"
+    _BUCKET_FIXED_GT_10 = "fixed_gt_10"
+    _BUCKET_FIXED_5_10 = "fixed_5_10"
+    _BUCKET_FIXED_3_5 = "fixed_3_5"
+    _BUCKET_FIXED_3 = "fixed_3"
+    _BUCKET_FIXED_2 = "fixed_2"
+    _BUCKET_FIXED_1 = "fixed_1"
+    _BUCKET_FIXED_UNKNOWN = "fixed_unknown"
+    _BUCKET_PROTECTED = "protected"
+
+    # Buckets are ordered from most evictable/allocatable to least evictable.
+    _BUCKET_ORDER = (
+        _BUCKET_UNCACHED,
+        _BUCKET_DYNAMIC,
+        _BUCKET_FIXED_GT_10,
+        _BUCKET_FIXED_5_10,
+        _BUCKET_FIXED_3_5,
+        _BUCKET_FIXED_3,
+        _BUCKET_FIXED_2,
+        _BUCKET_FIXED_1,
+        _BUCKET_FIXED_UNKNOWN,
+        _BUCKET_PROTECTED,
+    )
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        metadata_for_block: Callable[[KVCacheBlock], Any],
+        get_agent_live_blocks: Callable[[str, str], dict[Any, list[KVCacheBlock]]],
+    ) -> None:
+        self.metadata_for_block = metadata_for_block
+        self.get_agent_live_blocks = get_agent_live_blocks
+        self.num_free_blocks = 0
+        self._block_bucket: dict[int, str] = {}
+        self._bucket_heads: dict[str, KVCacheBlock] = {}
+        self._bucket_tails: dict[str, KVCacheBlock] = {}
+        for bucket in self._BUCKET_ORDER:
+            head = KVCacheBlock(block_id=-1)
+            tail = KVCacheBlock(block_id=-1)
+            head.next_free_block = tail
+            tail.prev_free_block = head
+            self._bucket_heads[bucket] = head
+            self._bucket_tails[bucket] = tail
+        self.append_n(blocks)
+
+    def popleft(self) -> KVCacheBlock:
+        if self.num_free_blocks == 0:
+            raise ValueError("No free blocks available")
+        return self.popleft_n(1)[0]
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        ret: list[KVCacheBlock] = []
+        while len(ret) < n:
+            block = self._popleft_one_from_first_nonempty_bucket()
+            ret.append(block)
+        return ret
+
+    def _popleft_one_from_first_nonempty_bucket(self) -> KVCacheBlock:
+        for bucket in self._BUCKET_ORDER:
+            head = self._bucket_heads[bucket]
+            tail = self._bucket_tails[bucket]
+            block = head.next_free_block
+            if block is tail or block is None:
+                continue
+            self._remove_from_bucket(block, bucket)
+            return block
+        raise ValueError("No free blocks available")
+
+    def remove(self, block: KVCacheBlock) -> None:
+        bucket = self._block_bucket.get(block.block_id)
+        if bucket is None:
+            raise RuntimeError(f"remove() called on an invalid block: {block}")
+        self._remove_from_bucket(block, bucket)
+
+    def append(self, block: KVCacheBlock) -> None:
+        self.append_n([block])
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        for block in blocks:
+            bucket = self._bucket_for_block(block)
+            self._append_to_bucket_tail(block, bucket)
+
+    def is_in_queue(self, block: KVCacheBlock) -> bool:
+        return block.block_id in self._block_bucket
+
+    def on_request_metadata(self, context: Any) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        workflow_id = req_metadata.workflow_key
+        if workflow_id is None:
+            return
+        agent_steps = req_metadata.agent_steps_to_execution
+        if not agent_steps:
+            return
+
+        block_steps: dict[int, tuple[KVCacheBlock, float]] = {}
+        for agent_id, step in agent_steps.items():
+            blocks_by_hash = context.get_agent_live_blocks(workflow_id, agent_id)
+            for blocks in blocks_by_hash.values():
+                for block in blocks:
+                    current = block_steps.get(block.block_id)
+                    if current is None or step < current[1]:
+                        block_steps[block.block_id] = (block, step)
+
+        for block, step in block_steps.values():
+            context.metadata_for_block(block).steps_to_execution = step
+            self.reposition_if_free(block)
+
+    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        metadata = context.metadata_for_block(block)
+        workflow_id = req_metadata.workflow_key
+        if metadata.prompt_part != "fixed" or workflow_id is None:
+            self.reposition_if_free(block)
+            return
+        step = self._step_for_block_agents(
+            context, workflow_id, block, req_metadata.agent_id
+        )
+        if step is not None:
+            metadata.steps_to_execution = step
+        self.reposition_if_free(block)
+
+    def on_cached_block_metadata_hit(
+        self, context: Any, block: KVCacheBlock, prompt_part: Any
+    ) -> None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        workflow_id = req_metadata.workflow_key
+        if prompt_part != "fixed" or workflow_id is None:
+            self.reposition_if_free(block)
+            return
+        step = self._step_for_block_agents(
+            context, workflow_id, block, req_metadata.agent_id
+        )
+        if step is not None:
+            context.metadata_for_block(block).steps_to_execution = step
+        self.reposition_if_free(block)
+
+    def reposition_if_free(self, block: KVCacheBlock) -> None:
+        old_bucket = self._block_bucket.get(block.block_id)
+        if old_bucket is None:
+            return
+        new_bucket = self._bucket_for_block(block)
+        if new_bucket == old_bucket:
+            return
+        self._remove_from_bucket(block, old_bucket)
+        self._append_to_bucket_tail(block, new_bucket)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        ret = []
+        for bucket in self._BUCKET_ORDER:
+            curr_block = self._bucket_heads[bucket].next_free_block
+            tail = self._bucket_tails[bucket]
+            while curr_block is not tail:
+                assert curr_block is not None
+                ret.append(curr_block)
+                curr_block = curr_block.next_free_block
+        return ret
+
+    def _append_to_bucket_tail(self, block: KVCacheBlock, bucket: str) -> None:
+        if block.block_id in self._block_bucket:
+            raise RuntimeError(f"append() called on a queued block: {block}")
+        tail = self._bucket_tails[bucket]
+        last_block = tail.prev_free_block
+        assert last_block is not None
+        block.prev_free_block = last_block
+        block.next_free_block = tail
+        last_block.next_free_block = block
+        tail.prev_free_block = block
+        self._block_bucket[block.block_id] = bucket
+        self.num_free_blocks += 1
+
+    def _remove_from_bucket(self, block: KVCacheBlock, bucket: str) -> None:
+        if block.prev_free_block is None or block.next_free_block is None:
+            raise RuntimeError(f"remove() called on an invalid block: {block}")
+        block.prev_free_block.next_free_block = block.next_free_block
+        block.next_free_block.prev_free_block = block.prev_free_block
+        block.prev_free_block = block.next_free_block = None
+        self._block_bucket.pop(block.block_id, None)
+        self.num_free_blocks -= 1
+
+    def _bucket_for_block(self, block: KVCacheBlock) -> str:
+        metadata = self.metadata_for_block(block)
+        if metadata.status in ("loading", "offloading", "reserved"):
+            return self._BUCKET_PROTECTED
+        if block.block_hash is None:
+            return self._BUCKET_UNCACHED
+        if metadata.prompt_part in ("dynamic", "output"):
+            return self._BUCKET_DYNAMIC
+        if metadata.prompt_part == "fixed":
+            step = metadata.steps_to_execution
+            if step is None:
+                return self._BUCKET_FIXED_UNKNOWN
+            if step <= 1:
+                return self._BUCKET_FIXED_1
+            if step <= 2:
+                return self._BUCKET_FIXED_2
+            if step <= 3:
+                return self._BUCKET_FIXED_3
+            if step <= 5:
+                return self._BUCKET_FIXED_3_5
+            if step <= 10:
+                return self._BUCKET_FIXED_5_10
+            return self._BUCKET_FIXED_GT_10
+        return self._BUCKET_DYNAMIC
+
+    def _step_for_block_agents(
+        self,
+        context: Any,
+        workflow_id: str,
+        block: KVCacheBlock,
+        fallback_agent_id: str | None = None,
+    ) -> float | None:
+        req_metadata = context.request.kv_cache_policy_metadata
+        steps = []
+        seen_agent_ids = set()
+        block_hash = block.block_hash
+        if block_hash is not None:
+            for agent_id in req_metadata.agent_steps_to_execution:
+                if agent_id in seen_agent_ids:
+                    continue
+                live_blocks = context.get_agent_live_blocks(workflow_id, agent_id)
+                if any(
+                    candidate.block_id == block.block_id
+                    for candidate in live_blocks.get(block_hash, ())
+                ):
+                    steps.append(req_metadata.agent_steps_to_execution[agent_id])
+                    seen_agent_ids.add(agent_id)
+
+        if fallback_agent_id is not None and fallback_agent_id not in seen_agent_ids:
+            step = req_metadata.step_for_agent(fallback_agent_id)
+            if step is not None:
+                steps.append(step)
+        return min(steps) if steps else None
 
 
 def need_extra_keys(request: Request) -> bool:

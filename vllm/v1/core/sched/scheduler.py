@@ -390,8 +390,6 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-        self._cleanup_expired_ttl_blocks()
-
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -839,13 +837,6 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
-                    if self.kv_cache_manager.force_clear_one_ttl():
-                        logger.info(
-                            "awbench ---- Retrying request scheduling after force-clearing "
-                            "one KV block TTL: request_id=%s",
-                            request.request_id,
-                        )
-                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1912,18 +1903,9 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
-            self.kv_cache_manager.maybe_pin_blocks_for_ttl(request)
             self._free_blocks(request)
 
         return kv_xfer_params
-
-    def _cleanup_expired_ttl_blocks(self) -> None:
-        protected_program_ids = {
-            req.kv_cache_policy_metadata.program_id
-            for req in self.waiting
-            if req.kv_cache_policy_metadata.program_id is not None
-        }
-        self.kv_cache_manager.clear_expired_ttls(protected_program_ids)
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()

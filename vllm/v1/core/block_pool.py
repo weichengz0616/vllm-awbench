@@ -14,11 +14,9 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
-    EvictionContext,
     KVBlockPolicyMetadata,
     RequestMetadataContext,
     get_prompt_part,
-    make_free_block_eviction_policy,
     monotonic_time,
 )
 from vllm.v1.core.kv_cache_utils import (
@@ -28,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashWithGroupId,
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
+    KVFlowFreeKVCacheBlockQueue,
     KVCacheBlock,
     get_block_hash,
     make_block_hash_with_group_id,
@@ -183,9 +182,6 @@ class BlockPool:
                 f"Supported policies: {valid_eviction_policies}"
             )
         self.agent_eviction_policy = eviction_policy
-        policy = make_free_block_eviction_policy(
-            eviction_policy, self._make_eviction_context
-        )
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -207,10 +203,15 @@ class BlockPool:
             num_reserved_blocks,
             enable_caching,
         )
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks, policy)
+        # Free block queue owns both ordering mechanics and eviction semantics.
+        if eviction_policy == "kvflow":
+            self.free_block_queue = KVFlowFreeKVCacheBlockQueue(
+                self.blocks,
+                metadata_for_block=self.get_block_metadata,
+                get_agent_live_blocks=self.get_agent_live_blocks,
+            )
+        else:
+            self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -229,18 +230,11 @@ class BlockPool:
 
         self.metrics_collector = metrics_collector
 
-    def _make_eviction_context(self) -> EvictionContext:
-        return EvictionContext(
-            now=monotonic_time(),
-            metadata_for_block=self.get_block_metadata,
-            free_block_pressure=1.0 - self.get_usage(),
-        )
-
     def get_block_metadata(self, block: KVCacheBlock) -> KVBlockPolicyMetadata:
         return self.block_metadata[block.block_id]
 
     def on_request_metadata(self, request: Request) -> None:
-        self.free_block_queue.eviction_policy.on_request_metadata(
+        self.free_block_queue.on_request_metadata(
             RequestMetadataContext(
                 request=request,
                 metadata_for_block=self.get_block_metadata,
@@ -430,7 +424,7 @@ class BlockPool:
         )
         metadata.critical = req_metadata.critical
         metadata.status = "gpu"
-        self.free_block_queue.eviction_policy.on_block_metadata_bound(
+        self.free_block_queue.on_block_metadata_bound(
             RequestMetadataContext(
                 request=request,
                 metadata_for_block=self.get_block_metadata,
@@ -439,26 +433,26 @@ class BlockPool:
             ),
             block,
         )
-        if (
-            metadata.workflow_id is not None
-            or metadata.program_id is not None
-            or metadata.agent_id is not None
-            or metadata.critical
-        ):
-            logger.info(
-                "awbench ---- Bound KV block metadata: block_id=%d request_id=%s "
-                "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s "
-                "steps_to_execution=%s critical=%s pool_class=%s",
-                block.block_id,
-                request.request_id,
-                metadata.workflow_id,
-                metadata.program_id,
-                metadata.agent_id,
-                metadata.prompt_part,
-                metadata.steps_to_execution,
-                metadata.critical,
-                metadata.pool_class,
-            )
+        # if (
+        #     metadata.workflow_id is not None
+        #     or metadata.program_id is not None
+        #     or metadata.agent_id is not None
+        #     or metadata.critical
+        # ):
+        #     logger.info(
+        #         "awbench ---- Bound KV block metadata: block_id=%d request_id=%s "
+        #         "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s "
+        #         "steps_to_execution=%s critical=%s pool_class=%s",
+        #         block.block_id,
+        #         request.request_id,
+        #         metadata.workflow_id,
+        #         metadata.program_id,
+        #         metadata.agent_id,
+        #         metadata.prompt_part,
+        #         metadata.steps_to_execution,
+        #         metadata.critical,
+        #         metadata.pool_class,
+        #     )
 
     def bind_prefetch_block_metadata(
         self,
@@ -509,64 +503,6 @@ class BlockPool:
                 self.block_metadata[block.block_id].workflow_id,
                 self.block_metadata[block.block_id].agent_id,
             )
-
-    def set_ttl_deadline_for_blocks(
-        self, blocks: Iterable[KVCacheBlock], ttl_deadline: float
-    ) -> None:
-        num_pinned_blocks = 0
-        for block in blocks:
-            if not block.is_null:
-                self.block_metadata[block.block_id].ttl_deadline = ttl_deadline
-                num_pinned_blocks += 1
-        if num_pinned_blocks:
-            logger.info(
-                "awbench ---- Pinned %d KV blocks with ttl_deadline=%.6f",
-                num_pinned_blocks,
-                ttl_deadline,
-            )
-
-    def clear_expired_ttls(self, now: float, protected_program_ids: set[str]) -> None:
-        num_cleared = 0
-        for metadata in self.block_metadata:
-            if (
-                metadata.ttl_deadline is not None
-                and metadata.ttl_deadline <= now
-                and (
-                    metadata.program_id is None
-                    or metadata.program_id not in protected_program_ids
-                )
-            ):
-                metadata.ttl_deadline = None
-                num_cleared += 1
-        if num_cleared:
-            logger.info(
-                "awbench ---- Cleared %d expired KV block TTLs at now=%.6f "
-                "protected_program_ids=%s",
-                num_cleared,
-                now,
-                sorted(protected_program_ids),
-            )
-
-    def force_clear_one_ttl(self) -> bool:
-        ttl_blocks = [
-            metadata
-            for metadata in self.block_metadata
-            if metadata.ttl_deadline is not None
-        ]
-        if not ttl_blocks:
-            return False
-        victim = max(ttl_blocks, key=lambda metadata: metadata.ttl_deadline or 0.0)
-        logger.info(
-            "awbench ---- Force-clearing one KV block TTL: workflow_id=%s program_id=%s "
-            "agent_id=%s prompt_part=%s ttl_deadline=%s",
-            victim.workflow_id,
-            victim.program_id,
-            victim.agent_id,
-            victim.prompt_part,
-            victim.ttl_deadline,
-        )
-        victim.ttl_deadline = None
-        return True
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -644,7 +580,7 @@ class BlockPool:
         ):
             return
 
-        self.free_block_queue.eviction_policy.on_cached_block_metadata_hit(
+        self.free_block_queue.on_cached_block_metadata_hit(
             RequestMetadataContext(
                 request=request,
                 metadata_for_block=self.get_block_metadata,

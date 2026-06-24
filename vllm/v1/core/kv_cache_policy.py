@@ -5,15 +5,11 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Protocol, TYPE_CHECKING
+from typing import Any, Literal, TYPE_CHECKING
 
-from vllm.v1.core.kv_cache_utils import (
-    BlockHashWithGroupId,
-    FreeBlockEvictionPolicy,
-    KVCacheBlock,
-)
+from vllm.v1.core.kv_cache_utils import BlockHashWithGroupId, KVCacheBlock
 
 if TYPE_CHECKING:
     from vllm.v1.request import Request
@@ -21,7 +17,7 @@ if TYPE_CHECKING:
 PromptPart = Literal["fixed", "dynamic", "output"]
 KVBlockStatus = Literal["gpu", "cpu", "loading", "offloading", "reserved"]
 KVPoolClass = Literal["shared", "reserved"]
-AgentKVEvictionPolicy = Literal["lru", "cachettl", "kvflow", "tokencake"]
+AgentKVEvictionPolicy = Literal["lru", "kvflow"]
 ProgramType = Literal["dag", "react"]
 
 
@@ -52,9 +48,6 @@ class KVBlockPolicyMetadata:
 @dataclass
 class KVRequestPolicyMetadata:
     # Common agent/workflow identifiers.
-    # workflow_id identifies the workflow template; program_id identifies a
-    # concrete workflow instance. External requests may pass template_id as an
-    # alias for workflow_id.
     workflow_id: str | None = None
     program_id: str | None = None
     program_type: ProgramType | None = None
@@ -65,11 +58,9 @@ class KVRequestPolicyMetadata:
     agent_steps_to_execution: dict[str, float] = field(default_factory=dict)
     next_agent_ids: list[str] = field(default_factory=list)
 
-    # CacheTTL / Tokencake metadata.
+    # Kept for compatibility with existing request metadata plumbing.
     ttl_seconds: float | None = None
     critical: bool = False
-
-    # Offload / tool-call metadata.
     session_id: str | None = None
     predicted_tool_time: float | None = None
     call_name: str | None = None
@@ -148,16 +139,7 @@ class KVRequestPolicyMetadata:
 
     @property
     def workflow_key(self) -> str | None:
-        """Identifier for workflow-template scoped agent state."""
         return self.workflow_id
-
-
-@dataclass
-class EvictionContext:
-    now: float
-    metadata_for_block: Callable[[KVCacheBlock], KVBlockPolicyMetadata]
-    free_block_pressure: float = 0.0
-    request_metadata: KVRequestPolicyMetadata | None = None
 
 
 @dataclass
@@ -171,222 +153,41 @@ class RequestMetadataContext:
     iter_block_metadata: Callable[[], Iterable[KVBlockPolicyMetadata]]
 
 
-class EvictionContextProvider(Protocol):
-    def __call__(self) -> EvictionContext: ...
+def kvflow_set_steps_to_execution(
+    metadata: KVBlockPolicyMetadata, step: float | None
+) -> None:
+    metadata.steps_to_execution = step
 
 
-def make_free_block_eviction_policy(
-    policy_name: AgentKVEvictionPolicy,
-    context_provider: EvictionContextProvider | None,
-) -> FreeBlockEvictionPolicy | None:
-    if policy_name == "lru":
-        return None
-    if context_provider is None:
-        return None
-    if policy_name == "cachettl":
-        return CacheTTLEvictionPolicy(context_provider)
-    if policy_name == "kvflow":
-        return KVFlowEvictionPolicy(context_provider)
-    if policy_name == "tokencake":
-        return TokencakeEvictionPolicy(context_provider)
-    return None
+def kvflow_step_for_block_agents(
+    context: RequestMetadataContext,
+    workflow_id: str,
+    block: KVCacheBlock,
+    fallback_agent_id: str | None = None,
+) -> float | None:
+    req_metadata = context.request.kv_cache_policy_metadata
+    steps = []
+    seen_agent_ids = set()
 
+    block_hash = block.block_hash
+    if block_hash is not None:
+        for agent_id in req_metadata.agent_steps_to_execution:
+            if agent_id in seen_agent_ids:
+                continue
+            live_blocks = context.get_agent_live_blocks(workflow_id, agent_id)
+            if any(
+                candidate.block_id == block.block_id
+                for candidate in live_blocks.get(block_hash, ())
+            ):
+                steps.append(req_metadata.agent_steps_to_execution[agent_id])
+                seen_agent_ids.add(agent_id)
 
-class BaseEvictionPolicy(FreeBlockEvictionPolicy):
-    policy_name: AgentKVEvictionPolicy = "lru"
-
-    def __init__(self, context_provider: EvictionContextProvider):
-        self.context_provider = context_provider
-
-    def on_request_metadata(self, context: RequestMetadataContext) -> None:
-        return
-
-    def on_block_metadata_bound(
-        self,
-        context: RequestMetadataContext,
-        block: KVCacheBlock,
-    ) -> None:
-        return
-
-    def on_cached_block_metadata_hit(
-        self,
-        context: RequestMetadataContext,
-        block: KVCacheBlock,
-        prompt_part: PromptPart,
-    ) -> None:
-        return
-
-    def insert_free_blocks(self, queue, blocks: list[KVCacheBlock]) -> None:
-        queue._append_tail_n(blocks)
-
-    def _select_by_key(self, queue, n: int, key_fn) -> list[KVCacheBlock]:
-        candidates = queue.get_all_free_blocks()
-        selected = sorted(
-            enumerate(candidates), key=lambda item: key_fn(item[1], item[0])
-        )[:n]
-        blocks = [block for _, block in selected]
-        for block in blocks:
-            queue.remove(block)
-        return blocks
-
-
-class CacheTTLEvictionPolicy(BaseEvictionPolicy):
-    """TTL-aware policy with LRU fallback."""
-
-    policy_name: AgentKVEvictionPolicy = "cachettl"
-
-    def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
-        ctx = self.context_provider()
-
-        def key(block: KVCacheBlock, lru_index: int):
-            meta = ctx.metadata_for_block(block)
-            if meta.status in ("loading", "offloading", "reserved"):
-                status_rank = 2
-            elif meta.ttl_deadline is None:
-                status_rank = 1
-            elif meta.ttl_deadline <= ctx.now:
-                status_rank = 0
-            else:
-                status_rank = 2
-            deadline = (
-                meta.ttl_deadline if meta.ttl_deadline is not None else float("inf")
-            )
-            return (status_rank, deadline, lru_index)
-
-        return self._select_by_key(queue, n, key)
-
-
-class KVFlowEvictionPolicy(BaseEvictionPolicy):
-    """Workflow-aware policy for KVFlow."""
-
-    policy_name: AgentKVEvictionPolicy = "kvflow"
-
-    @staticmethod
-    def _set_steps_to_execution(
-        metadata: KVBlockPolicyMetadata, step: float | None
-    ) -> None:
-        metadata.steps_to_execution = step
-
-    def _step_for_block_agents(
-        self,
-        context: RequestMetadataContext,
-        workflow_id: str,
-        block: KVCacheBlock,
-        fallback_agent_id: str | None = None,
-    ) -> float | None:
-        req_metadata = context.request.kv_cache_policy_metadata
-        steps = []
-        seen_agent_ids = set()
-
-        block_hash = block.block_hash
-        if block_hash is not None:
-            for agent_id in req_metadata.agent_steps_to_execution:
-                if agent_id in seen_agent_ids:
-                    continue
-                live_blocks = context.get_agent_live_blocks(workflow_id, agent_id)
-                if any(
-                    candidate.block_id == block.block_id
-                    for candidate in live_blocks.get(block_hash, ())
-                ):
-                    steps.append(req_metadata.agent_steps_to_execution[agent_id])
-                    seen_agent_ids.add(agent_id)
-
-        if fallback_agent_id is not None and fallback_agent_id not in seen_agent_ids:
-            step = req_metadata.step_for_agent(fallback_agent_id)
-            if step is not None:
-                steps.append(step)
-
-        return min(steps) if steps else None
-
-    def on_block_metadata_bound(
-        self,
-        context: RequestMetadataContext,
-        block: KVCacheBlock,
-    ) -> None:
-        req_metadata = context.request.kv_cache_policy_metadata
-        metadata = context.metadata_for_block(block)
-        workflow_id = req_metadata.workflow_key
-        if metadata.prompt_part != "fixed" or workflow_id is None:
-            return
-        step = self._step_for_block_agents(
-            context, workflow_id, block, req_metadata.agent_id
-        )
+    if fallback_agent_id is not None and fallback_agent_id not in seen_agent_ids:
+        step = req_metadata.step_for_agent(fallback_agent_id)
         if step is not None:
-            self._set_steps_to_execution(metadata, step)
+            steps.append(step)
 
-    def on_cached_block_metadata_hit(
-        self,
-        context: RequestMetadataContext,
-        block: KVCacheBlock,
-        prompt_part: PromptPart,
-    ) -> None:
-        req_metadata = context.request.kv_cache_policy_metadata
-        workflow_id = req_metadata.workflow_key
-        if prompt_part != "fixed" or workflow_id is None:
-            return
-        step = self._step_for_block_agents(
-            context, workflow_id, block, req_metadata.agent_id
-        )
-        if step is not None:
-            self._set_steps_to_execution(context.metadata_for_block(block), step)
-
-    def on_request_metadata(self, context: RequestMetadataContext) -> None:
-        req_metadata = context.request.kv_cache_policy_metadata
-        workflow_id = req_metadata.workflow_key
-        if workflow_id is None:
-            return
-
-        agent_steps = req_metadata.agent_steps_to_execution
-        if not agent_steps:
-            return
-
-        block_steps: dict[int, tuple[KVCacheBlock, float]] = {}
-        for agent_id, step in agent_steps.items():
-            blocks_by_hash = context.get_agent_live_blocks(workflow_id, agent_id)
-            for blocks in blocks_by_hash.values():
-                for block in blocks:
-                    current = block_steps.get(block.block_id)
-                    if current is None or step < current[1]:
-                        block_steps[block.block_id] = (block, step)
-
-        for block, step in block_steps.values():
-            self._set_steps_to_execution(context.metadata_for_block(block), step)
-
-    def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
-        ctx = self.context_provider()
-
-        def key(block: KVCacheBlock, lru_index: int):
-            meta = ctx.metadata_for_block(block)
-            if meta.status in ("loading", "offloading", "reserved"):
-                return (4, 0, lru_index)
-            if meta.prompt_part in ("dynamic", "output"):
-                return (0, 0, lru_index)
-            if meta.prompt_part == "fixed" and meta.steps_to_execution is not None:
-                return (1, -meta.steps_to_execution, lru_index)
-            return (2, 0, lru_index)
-
-        return self._select_by_key(queue, n, key)
-
-
-class TokencakeEvictionPolicy(BaseEvictionPolicy):
-    """Reserved-pool aware policy for Tokencake."""
-
-    policy_name: AgentKVEvictionPolicy = "tokencake"
-
-    def select_victims(self, queue, n: int) -> list[KVCacheBlock]:
-        ctx = self.context_provider()
-        req_meta = ctx.request_metadata
-        critical_request = bool(req_meta and req_meta.critical)
-
-        def key(block: KVCacheBlock, lru_index: int):
-            meta = ctx.metadata_for_block(block)
-            if meta.status in ("loading", "offloading", "reserved"):
-                return (4, lru_index)
-            if critical_request:
-                return (0 if meta.pool_class == "reserved" else 1, lru_index)
-            return (0 if meta.pool_class == "shared" else 3, lru_index)
-
-        return self._select_by_key(queue, n, key)
+    return min(steps) if steps else None
 
 
 def get_prompt_part(

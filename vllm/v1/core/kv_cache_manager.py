@@ -13,8 +13,6 @@ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_policy import (
     AgentKVEvictionPolicy,
     align_fixed_prefix_len,
-    monotonic_time,
-    ttl_deadline,
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -486,16 +484,16 @@ class KVCacheManager:
         self._record_agent_fixed_block_hashes(request)
         if bound_blocks:
             metadata = request.kv_cache_policy_metadata
-            logger.info(
-                "awbench ---- Bound KV metadata to %d new blocks for request_id=%s "
-                "workflow_id=%s program_id=%s agent_id=%s fixed_prefix_len=%s",
-                bound_blocks,
-                request.request_id,
-                metadata.workflow_key,
-                metadata.program_id,
-                metadata.agent_id,
-                metadata.fixed_prefix_len,
-            )
+            # logger.info(
+            #     "awbench ---- Bound KV metadata to %d new blocks for request_id=%s "
+            #     "workflow_id=%s program_id=%s agent_id=%s fixed_prefix_len=%s",
+            #     bound_blocks,
+            #     request.request_id,
+            #     metadata.workflow_key,
+            #     metadata.program_id,
+            #     metadata.agent_id,
+            #     metadata.fixed_prefix_len,
+            # )
 
     def _record_agent_fixed_block_hashes(self, request: Request) -> None:
         metadata = request.kv_cache_policy_metadata
@@ -698,35 +696,6 @@ class KVCacheManager:
             request: The request to free the blocks.
         """
         self.coordinator.free(request.request_id)
-
-    def maybe_pin_blocks_for_ttl(self, request: Request) -> bool:
-        deadline = ttl_deadline(monotonic_time(), request.kv_cache_policy_metadata)
-        if deadline is None:
-            return False
-        num_blocks = 0
-        for blocks in self.coordinator.get_blocks(request.request_id):
-            self.block_pool.set_ttl_deadline_for_blocks(blocks, deadline)
-            num_blocks += sum(not block.is_null for block in blocks)
-        metadata = request.kv_cache_policy_metadata
-        logger.info(
-            "awbench ---- Pinned request KV blocks for TTL: request_id=%s workflow_id=%s "
-            "program_id=%s agent_id=%s ttl_seconds=%s ttl_deadline=%.6f "
-            "num_blocks=%d",
-            request.request_id,
-            metadata.workflow_key,
-            metadata.program_id,
-            metadata.agent_id,
-            metadata.ttl_seconds,
-            deadline,
-            num_blocks,
-        )
-        return True
-
-    def clear_expired_ttls(self, protected_program_ids: set[str]) -> None:
-        self.block_pool.clear_expired_ttls(monotonic_time(), protected_program_ids)
-
-    def force_clear_one_ttl(self) -> bool:
-        return self.block_pool.force_clear_one_ttl()
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
