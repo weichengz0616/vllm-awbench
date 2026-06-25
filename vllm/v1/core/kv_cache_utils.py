@@ -211,9 +211,6 @@ class FreeKVCacheBlockQueue:
     def on_request_metadata(self, context: Any) -> None:
         return
 
-    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
-        return
-
     def on_cached_block_metadata_hit(
         self, context: Any, block: KVCacheBlock, prompt_part: Any
     ) -> None:
@@ -404,13 +401,13 @@ class KVFlowFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
     _BUCKET_ORDER = (
         _BUCKET_UNCACHED,
         _BUCKET_DYNAMIC,
+        _BUCKET_FIXED_UNKNOWN,
         _BUCKET_FIXED_GT_10,
         _BUCKET_FIXED_5_10,
         _BUCKET_FIXED_3_5,
         _BUCKET_FIXED_3,
         _BUCKET_FIXED_2,
         _BUCKET_FIXED_1,
-        _BUCKET_FIXED_UNKNOWN,
         _BUCKET_PROTECTED,
     )
 
@@ -500,34 +497,21 @@ class KVFlowFreeKVCacheBlockQueue(FreeKVCacheBlockQueue):
             context.metadata_for_block(block).steps_to_execution = step
             self.reposition_if_free(block)
 
-    def on_block_metadata_bound(self, context: Any, block: KVCacheBlock) -> None:
-        req_metadata = context.request.kv_cache_policy_metadata
-        metadata = context.metadata_for_block(block)
-        workflow_id = req_metadata.workflow_key
-        if metadata.prompt_part != "fixed" or workflow_id is None:
-            self.reposition_if_free(block)
-            return
-        step = self._step_for_block_agents(
-            context, workflow_id, block, req_metadata.agent_id
-        )
-        if step is not None:
-            metadata.steps_to_execution = step
-        self.reposition_if_free(block)
-
     def on_cached_block_metadata_hit(
         self, context: Any, block: KVCacheBlock, prompt_part: Any
     ) -> None:
         req_metadata = context.request.kv_cache_policy_metadata
         workflow_id = req_metadata.workflow_key
-        if prompt_part != "fixed" or workflow_id is None:
-            self.reposition_if_free(block)
+        if (
+            prompt_part != "fixed"
+            or workflow_id is None
+            or not req_metadata.agent_steps_to_execution
+        ):
             return
-        step = self._step_for_block_agents(
-            context, workflow_id, block, req_metadata.agent_id
-        )
+        step = self._step_for_block_agents(context, workflow_id, block)
         if step is not None:
             context.metadata_for_block(block).steps_to_execution = step
-        self.reposition_if_free(block)
+            self.reposition_if_free(block)
 
     def reposition_if_free(self, block: KVCacheBlock) -> None:
         old_bucket = self._block_bucket.get(block.block_id)

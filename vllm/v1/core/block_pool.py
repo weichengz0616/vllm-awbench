@@ -419,20 +419,15 @@ class BlockPool:
             req_metadata.fixed_prefix_len,
             request.num_prompt_tokens,
         )
-        metadata.steps_to_execution = req_metadata.step_for_agent(
-            req_metadata.agent_id
+        metadata.steps_to_execution = (
+            req_metadata.step_for_agent(req_metadata.agent_id)
+            if metadata.prompt_part == "fixed"
+            else None
         )
+        if metadata.prompt_part == "fixed" and metadata.steps_to_execution is None:
+            metadata.steps_to_execution = 0
         metadata.critical = req_metadata.critical
         metadata.status = "gpu"
-        self.free_block_queue.on_block_metadata_bound(
-            RequestMetadataContext(
-                request=request,
-                metadata_for_block=self.get_block_metadata,
-                get_agent_live_blocks=self.get_agent_live_blocks,
-                iter_block_metadata=lambda: iter(self.block_metadata),
-            ),
-            block,
-        )
         # if (
         #     metadata.workflow_id is not None
         #     or metadata.program_id is not None
@@ -580,6 +575,9 @@ class BlockPool:
         ):
             return
 
+        self._record_agent_live_block(
+            workflow_id, agent_id, block, block.block_hash
+        )
         self.free_block_queue.on_cached_block_metadata_hit(
             RequestMetadataContext(
                 request=request,
@@ -589,9 +587,6 @@ class BlockPool:
             ),
             block,
             prompt_part,
-        )
-        self._record_agent_live_block(
-            workflow_id, agent_id, block, block.block_hash
         )
 
     def _maybe_record_agent_live_block(
@@ -618,15 +613,17 @@ class BlockPool:
         agent_key = (workflow_id, agent_id)
         blocks_by_hash = self._agent_live_blocks.setdefault(agent_key, {})
         blocks_by_id = blocks_by_hash.setdefault(block_hash, {})
+        already_recorded = block.block_id in blocks_by_id
         blocks_by_id[block.block_id] = block
-        logger.info(
-            "awbench ---- Recorded live agent KV block: workflow_id=%s agent_id=%s "
-            "block_id=%d block_hash=%s",
-            workflow_id,
-            agent_id,
-            block.block_id,
-            block_hash,
-        )
+        if not already_recorded:
+            logger.info(
+                "awbench ---- Recorded live agent KV block: workflow_id=%s agent_id=%s "
+                "block_id=%d block_hash=%s",
+                workflow_id,
+                agent_id,
+                block.block_id,
+                block_hash,
+            )
 
     def _maybe_remove_agent_live_block(
         self, block: KVCacheBlock, block_hash: BlockHashWithGroupId

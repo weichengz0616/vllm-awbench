@@ -153,42 +153,6 @@ class RequestMetadataContext:
     iter_block_metadata: Callable[[], Iterable[KVBlockPolicyMetadata]]
 
 
-def kvflow_set_steps_to_execution(
-    metadata: KVBlockPolicyMetadata, step: float | None
-) -> None:
-    metadata.steps_to_execution = step
-
-
-def kvflow_step_for_block_agents(
-    context: RequestMetadataContext,
-    workflow_id: str,
-    block: KVCacheBlock,
-    fallback_agent_id: str | None = None,
-) -> float | None:
-    req_metadata = context.request.kv_cache_policy_metadata
-    steps = []
-    seen_agent_ids = set()
-
-    block_hash = block.block_hash
-    if block_hash is not None:
-        for agent_id in req_metadata.agent_steps_to_execution:
-            if agent_id in seen_agent_ids:
-                continue
-            live_blocks = context.get_agent_live_blocks(workflow_id, agent_id)
-            if any(
-                candidate.block_id == block.block_id
-                for candidate in live_blocks.get(block_hash, ())
-            ):
-                steps.append(req_metadata.agent_steps_to_execution[agent_id])
-                seen_agent_ids.add(agent_id)
-
-    if fallback_agent_id is not None and fallback_agent_id not in seen_agent_ids:
-        step = req_metadata.step_for_agent(fallback_agent_id)
-        if step is not None:
-            steps.append(step)
-
-    return min(steps) if steps else None
-
 
 def get_prompt_part(
     block_index: int,
