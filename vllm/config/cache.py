@@ -176,6 +176,9 @@ class CacheConfig:
     agent_kv_offload_policy: AgentKVOffloadPolicy = "default"
     """Agent-aware KV offload policy. Defaults to existing offload behavior."""
 
+    cachettl_static_ttl_seconds: float = Field(default=2.0, ge=0.0)
+    """Static TTL, in seconds, for CacheTTL request-level KV pinning."""
+
     tokencake_reserved_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     """Fraction of GPU KV blocks reserved for critical Tokencake requests."""
 
@@ -208,6 +211,7 @@ class CacheConfig:
             "kv_sharing_fast_prefill",
             "agent_kv_eviction_policy",
             "agent_kv_offload_policy",
+            "cachettl_static_ttl_seconds",
             "tokencake_reserved_ratio",
         }
 

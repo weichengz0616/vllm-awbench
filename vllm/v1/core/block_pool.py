@@ -17,7 +17,6 @@ from vllm.v1.core.kv_cache_policy import (
     KVBlockPolicyMetadata,
     RequestMetadataContext,
     get_prompt_part,
-    monotonic_time,
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,

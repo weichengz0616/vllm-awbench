@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -72,6 +72,15 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class PinnedCacheTTLRequest:
+    program_id: str
+    request: Request
+    deadline: float
+    pinned_at: float
+    program_arrival_time: float
 
 
 class Scheduler(SchedulerInterface):
@@ -184,6 +193,12 @@ class Scheduler(SchedulerInterface):
         # Priority queues for requests.
         self.waiting = create_request_queue(self.policy)
         self.running: list[Request] = []
+
+        self.cachettl_enabled = (
+            self.cache_config.agent_kv_eviction_policy == "cachettl"
+        )
+        self.cachettl_pinned: dict[str, PinnedCacheTTLRequest] = {}
+        self.cachettl_program_arrival_time: dict[str, float] = {}
 
         # The request IDs that are finished in between the previous and the
         # current steps. This is used to notify the workers about the finished
@@ -380,6 +395,8 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
+        self._cachettl_expire_pinned_requests(time.monotonic())
+
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -596,6 +613,7 @@ class Scheduler(SchedulerInterface):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
+                self._cachettl_promote_waiting_request()
                 request = self.waiting.peek_request()
                 request_id = request.request_id
                 load_plan = None
@@ -830,6 +848,19 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens=num_encoder_tokens,
                 )
 
+                # CacheTTL: release a pinned request under memory pressure.
+                if new_blocks is None and self._cachettl_release_victim_pin():
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                    )
+
                 if new_blocks is None:
                     # The request cannot be scheduled.
 
@@ -909,6 +940,7 @@ class Scheduler(SchedulerInterface):
                 # Count the number of prefix cached tokens.
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_computed_tokens
+                self._cachettl_release_predecessor_after_schedule(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
                     scheduled_encoder_inputs[request_id] = encoder_inputs_to_schedule
@@ -1832,6 +1864,7 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            self._cachettl_on_request_arrive(request)
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
@@ -1903,7 +1936,8 @@ class Scheduler(SchedulerInterface):
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
-            self._free_blocks(request)
+            if not self._cachettl_pin_finished_request(request):
+                self._free_blocks(request)
 
         return kv_xfer_params
 
@@ -1911,6 +1945,153 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def _cachettl_program_id(self, request: Request) -> str | None:
+        metadata = request.kv_cache_policy_metadata
+        return metadata.program_id or metadata.session_id
+
+    def _cachettl_on_request_arrive(self, request: Request) -> None:
+        if not self.cachettl_enabled:
+            return
+        program_id = self._cachettl_program_id(request)
+        if program_id is None:
+            return
+        self.cachettl_program_arrival_time.setdefault(
+            program_id, request.arrival_time
+        )
+
+    def _cachettl_pin_finished_request(self, request: Request) -> bool:
+        if not self.cachettl_enabled:
+            return False
+        metadata = request.kv_cache_policy_metadata
+        program_id = self._cachettl_program_id(request)
+        if program_id is None or metadata.is_program_done:
+            return False
+        ttl_seconds = (
+            metadata.ttl_seconds
+            if metadata.ttl_seconds is not None
+            else self.cache_config.cachettl_static_ttl_seconds
+        )
+        if ttl_seconds <= 0:
+            return False
+
+        previous = self.cachettl_pinned.get(program_id)
+        if previous is not None and previous.request.request_id != request.request_id:
+            self._cachettl_release_pinned_request(program_id, "replace")
+
+        now = time.monotonic()
+        self.cachettl_pinned[program_id] = PinnedCacheTTLRequest(
+            program_id=program_id,
+            request=request,
+            deadline=now + ttl_seconds,
+            pinned_at=now,
+            program_arrival_time=self.cachettl_program_arrival_time.get(
+                program_id, request.arrival_time
+            ),
+        )
+        logger.debug(
+            "CacheTTL pinned request_id=%s program_id=%s ttl=%.3fs",
+            request.request_id,
+            program_id,
+            ttl_seconds,
+        )
+        return True
+
+    def _cachettl_promote_waiting_request(self) -> None:
+        if (
+            not self.cachettl_enabled
+            or not self.cachettl_pinned
+            or self.policy == SchedulingPolicy.PRIORITY
+            or not self.waiting
+        ):
+            return
+        if any(request.status == RequestStatus.PREEMPTED for request in self.waiting):
+            return
+
+        best_request: Request | None = None
+        best_arrival_time: float | None = None
+        for request in self.waiting:
+            program_id = self._cachettl_program_id(request)
+            if program_id is None:
+                continue
+            pinned = self.cachettl_pinned.get(program_id)
+            if pinned is None:
+                continue
+            if (
+                best_arrival_time is None
+                or pinned.program_arrival_time < best_arrival_time
+            ):
+                best_request = request
+                best_arrival_time = pinned.program_arrival_time
+
+        if best_request is None or best_request is self.waiting.peek_request():
+            return
+
+        self.waiting.remove_request(best_request)
+        self.waiting.prepend_request(best_request)
+        logger.debug(
+            "CacheTTL promoted waiting request_id=%s program_id=%s",
+            best_request.request_id,
+            self._cachettl_program_id(best_request),
+        )
+
+    def _cachettl_release_predecessor_after_schedule(
+        self, request: Request
+    ) -> None:
+        if not self.cachettl_enabled:
+            return
+        program_id = self._cachettl_program_id(request)
+        if program_id is None:
+            return
+        pinned = self.cachettl_pinned.get(program_id)
+        if pinned is None or pinned.request.request_id == request.request_id:
+            return
+        self._cachettl_release_pinned_request(program_id, "next_request_scheduled")
+
+    def _cachettl_expire_pinned_requests(self, now: float) -> None:
+        if not self.cachettl_enabled or not self.cachettl_pinned:
+            return
+        active_programs = {
+            program_id
+            for request in itertools.chain(self.waiting, self.running)
+            if (program_id := self._cachettl_program_id(request)) is not None
+        }
+        expired_programs = [
+            program_id
+            for program_id, pinned in self.cachettl_pinned.items()
+            if pinned.deadline <= now and program_id not in active_programs
+        ]
+        for program_id in expired_programs:
+            self._cachettl_release_pinned_request(program_id, "ttl_expired")
+
+    def _cachettl_release_victim_pin(self) -> bool:
+        if not self.cachettl_enabled or not self.cachettl_pinned:
+            return False
+        victim_program_id = max(
+            self.cachettl_pinned,
+            key=lambda program_id: self.cachettl_pinned[
+                program_id
+            ].program_arrival_time,
+        )
+        self._cachettl_release_pinned_request(victim_program_id, "memory_pressure")
+        return True
+
+    def _cachettl_release_pinned_request(
+        self, program_id: str, reason: str
+    ) -> None:
+        pinned = self.cachettl_pinned.pop(program_id, None)
+        if pinned is None:
+            return
+        request = pinned.request
+        if request.request_id not in self.requests:
+            return
+        logger.debug(
+            "CacheTTL releasing pinned request_id=%s program_id=%s reason=%s",
+            request.request_id,
+            program_id,
+            reason,
+        )
+        self._free_blocks(request)
 
     def get_num_unfinished_requests(self) -> int:
         num_waiting = len(self.waiting) - self.num_waiting_for_streaming_input

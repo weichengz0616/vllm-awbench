@@ -593,6 +593,7 @@ class EngineArgs:
     agent_kv_offload_policy: AgentKVOffloadPolicy = (
         CacheConfig.agent_kv_offload_policy
     )
+    cachettl_static_ttl_seconds: float = CacheConfig.cachettl_static_ttl_seconds
     tokencake_reserved_ratio: float = CacheConfig.tokencake_reserved_ratio
     tokens_only: bool = False
 
@@ -984,6 +985,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--agent-kv-offload-policy",
             **cache_kwargs["agent_kv_offload_policy"],
+        )
+        cache_group.add_argument(
+            "--cachettl-static-ttl-seconds",
+            **cache_kwargs["cachettl_static_ttl_seconds"],
         )
         cache_group.add_argument(
             "--tokencake-reserved-ratio",
@@ -1473,6 +1478,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             agent_kv_eviction_policy=self.agent_kv_eviction_policy,
             agent_kv_offload_policy=self.agent_kv_offload_policy,
+            cachettl_static_ttl_seconds=self.cachettl_static_ttl_seconds,
             tokencake_reserved_ratio=self.tokencake_reserved_ratio,
         )
 

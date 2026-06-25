@@ -127,21 +127,17 @@ class DummyBlocks:
         return (self._block_ids,)
 
 
-def test_cachettl_eviction_prefers_expired_ttl_blocks():
+def test_cachettl_eviction_policy_uses_default_free_queue():
     pool = BlockPool(
         num_gpu_blocks=4,
         enable_caching=False,
         hash_block_size=16,
         eviction_policy="cachettl",
     )
-    # Set deadlines around the real monotonic value.
-    real_now = pool._make_eviction_context().now
-    pool.block_metadata[1].ttl_deadline = real_now + 10
-    pool.block_metadata[2].ttl_deadline = real_now - 1
 
     victim = pool.free_block_queue.popleft()
 
-    assert victim.block_id == 2
+    assert victim.block_id == 1
 
 
 def test_kvflow_eviction_prefers_dynamic_then_larger_step_distance():
@@ -151,6 +147,10 @@ def test_kvflow_eviction_prefers_dynamic_then_larger_step_distance():
         hash_block_size=16,
         eviction_policy="kvflow",
     )
+    for block_id in (1, 2, 3, 4):
+        pool.blocks[block_id].block_hash = make_block_hash_with_group_id(
+            f"block-{block_id}".encode(), 0
+        )
     pool.block_metadata[1].prompt_part = "fixed"
     pool.block_metadata[1].steps_to_execution = 1
     pool.block_metadata[2].prompt_part = "fixed"
@@ -158,6 +158,8 @@ def test_kvflow_eviction_prefers_dynamic_then_larger_step_distance():
     pool.block_metadata[3].prompt_part = "dynamic"
     pool.block_metadata[4].prompt_part = "fixed"
     pool.block_metadata[4].steps_to_execution = 0
+    for block_id in (1, 2, 3, 4):
+        pool.free_block_queue.reposition_if_free(pool.blocks[block_id])
 
     first = pool.free_block_queue.popleft()
     second = pool.free_block_queue.popleft()

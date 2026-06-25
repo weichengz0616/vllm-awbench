@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 PromptPart = Literal["fixed", "dynamic", "output"]
 KVBlockStatus = Literal["gpu", "cpu", "loading", "offloading", "reserved"]
 KVPoolClass = Literal["shared", "reserved"]
-AgentKVEvictionPolicy = Literal["lru", "kvflow"]
+AgentKVEvictionPolicy = Literal["lru", "cachettl", "kvflow", "tokencake"]
 ProgramType = Literal["dag", "react"]
 
 
@@ -66,6 +66,7 @@ class KVRequestPolicyMetadata:
     call_name: str | None = None
     call_duration: float | None = None
     function_event: Literal["call_start", "call_finish"] | None = None
+    is_program_done: bool = False
 
     @classmethod
     def from_extra_args(
@@ -130,6 +131,13 @@ class KVRequestPolicyMetadata:
             function_event=raw.get("function_event")
             if raw.get("function_event") in ("call_start", "call_finish")
             else None,
+            is_program_done=bool(
+                _as_bool(
+                    raw.get("is_program_done")
+                    if raw.get("is_program_done") is not None
+                    else raw.get("program_done")
+                )
+            ),
         )
 
     def step_for_agent(self, agent_id: str | None) -> float | None:
@@ -210,6 +218,12 @@ def _as_int(value: Any) -> int | None:
 def _as_float(value: Any) -> float | None:
     if _is_number(value):
         return float(value)
+    return None
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
     return None
 
 
