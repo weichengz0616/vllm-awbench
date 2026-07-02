@@ -767,7 +767,7 @@ def test_prefetch_manager_uses_unique_batches_and_limits_inflight():
 
 
 
-def test_tokencake_offload_policy_offloads_call_start_stall():
+def test_tokencake_offload_policy_offloads_profitable_tool_stall():
     policy = TokencakeOffloadPolicy()
     req = DummyRequest(
         KVRequestPolicyMetadata(
@@ -775,14 +775,28 @@ def test_tokencake_offload_policy_offloads_call_start_stall():
             program_type="react",
             agent_id="a0",
             session_id="s0",
-            call_name="search",
-            call_duration=10.0,
-            function_event="call_start",
+            next_op_type="tool",
+            next_tool_type="search",
+            predicted_tool_time=10.0,
+            multi_turn_kv_reuse=True,
         ),
         request_id="r0",
         num_computed_tokens=4,
         block_hashes=[b"h0", b"h1"],
     )
+    state = OffloadPolicyState(
+        gpu_block_size=2,
+        offloaded_block_size=2,
+        block_size_factor=1,
+    )
+    action = policy.on_request_finished(
+        request=req,
+        offload_state=state,
+        waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
+        now=0.0,
+    )
+    assert action == TokencakeOffloadPolicy.FINISH_OFFLOAD
+
     scheduler_output = SimpleNamespace(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=SimpleNamespace(
@@ -793,13 +807,9 @@ def test_tokencake_offload_policy_offloads_call_start_stall():
     context = OffloadDecisionContext(
         scheduler_output=scheduler_output,
         requests={"r0": req},
-        offload_state=OffloadPolicyState(
-            gpu_block_size=2,
-            offloaded_block_size=2,
-            block_size_factor=1,
-        ),
+        offload_state=state,
         kv_cache_manager=DummyKVCacheManager({"r0": [4, 5]}),
-        running=[req],
+        running=[],
         waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
         preempted_req_ids=set(),
     )
@@ -812,23 +822,79 @@ def test_tokencake_offload_policy_offloads_call_start_stall():
     assert plan.block_ranges[0].gpu_block_ids == [4, 5]
 
 
-def test_tokencake_load_policy_prefetches_same_react_session_hashes():
+def test_tokencake_offload_policy_pins_short_tool_stall():
     policy = TokencakeOffloadPolicy()
-    start_req = DummyRequest(
+    req = DummyRequest(
         KVRequestPolicyMetadata(
             program_id="p0",
             program_type="react",
             agent_id="a0",
             session_id="s0",
-            call_name="search",
-            call_duration=10.0,
-            function_event="call_start",
+            next_op_type="tool",
+            next_tool_type="search",
+            predicted_tool_time=0.001,
+            multi_turn_kv_reuse=True,
         ),
         request_id="r0",
         num_computed_tokens=4,
         block_hashes=[b"h0", b"h1"],
     )
-    policy.get_offload_plan(
+
+    action = policy.on_request_finished(
+        request=req,
+        offload_state=OffloadPolicyState(
+            gpu_block_size=2,
+            offloaded_block_size=2,
+            block_size_factor=1,
+        ),
+        waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
+        now=0.0,
+    )
+
+    assert action == TokencakeOffloadPolicy.FINISH_PIN
+    assert policy.num_pending_finished_offloads() == 0
+    consumer = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            program_type="react",
+            agent_id="a0",
+            session_id="s0",
+        ),
+        request_id="r1",
+    )
+    assert policy.take_pinned_releases_for_scheduled([consumer]) == ["r0"]
+
+
+def test_tokencake_load_policy_predictively_prefetches_offloaded_session():
+    policy = TokencakeOffloadPolicy()
+    start_req = DummyRequest(
+        KVRequestPolicyMetadata(
+            program_id="p0",
+            workflow_id="wf0",
+            program_type="react",
+            agent_id="a0",
+            session_id="s0",
+            next_op_type="tool",
+            next_tool_type="search",
+            predicted_tool_time=1.0,
+            multi_turn_kv_reuse=True,
+        ),
+        request_id="r0",
+        num_computed_tokens=4,
+        block_hashes=[b"h0", b"h1"],
+    )
+    state = OffloadPolicyState(
+        gpu_block_size=2,
+        offloaded_block_size=2,
+        block_size_factor=1,
+    )
+    policy.on_request_finished(
+        request=start_req,
+        offload_state=state,
+        waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
+        now=0.0,
+    )
+    offload_plan = policy.get_offload_plan(
         OffloadDecisionContext(
             scheduler_output=SimpleNamespace(
                 scheduled_new_reqs=[],
@@ -838,56 +904,39 @@ def test_tokencake_load_policy_prefetches_same_react_session_hashes():
                 num_scheduled_tokens={},
             ),
             requests={"r0": start_req},
-            offload_state=OffloadPolicyState(
-                gpu_block_size=2,
-                offloaded_block_size=2,
-                block_size_factor=1,
-            ),
+            offload_state=state,
             kv_cache_manager=DummyKVCacheManager({"r0": [4, 5]}),
-            running=[start_req],
+            running=[],
             waiting=[DummyRequest(KVRequestPolicyMetadata(), request_id="waiting")],
             preempted_req_ids=set(),
             now=0.0,
         )
     )
-    finish_req = DummyRequest(
-        KVRequestPolicyMetadata(
-            program_id="p0",
-            program_type="react",
-            agent_id="a0",
-            session_id="s0",
-            call_name="search",
-            function_event="call_finish",
-        ),
-        request_id="r1",
-        block_hashes=[b"h0", b"h1", b"h2"],
+    policy.update_after_connector_meta(
+        SimpleNamespace(
+            loads=[],
+            offloads=[offload_plan],
+            prepared_load_ranges=[],
+            prepared_offload_ranges=list(offload_plan.block_ranges),
+        )
     )
+    manager = DummyKVCacheManager({})
 
     plan = policy.get_load_plan(
         LoadDecisionContext(
-            request_infos=[
-                LoadRequestInfo(
-                    request=finish_req,
-                    num_local_computed_tokens=0,
-                    num_external_computed_tokens=0,
-                    load_kv_async=True,
-                    allocated_blocks=DummyBlocks([11, 12, 13]),
-                )
-            ],
-            offload_state=OffloadPolicyState(
-                gpu_block_size=2,
-                offloaded_block_size=2,
-                block_size_factor=1,
-            ),
-            kv_cache_manager=DummyKVCacheManager({}),
+            request_infos=[],
+            offload_state=state,
+            kv_cache_manager=manager,
             token_budget=0,
             max_num_running_reqs=1,
-            num_running_reqs=1,
+            num_running_reqs=0,
             now=1.0,
+            lookup_block_hashes=lambda hashes: len(hashes),
         )
     )
 
     assert len(plan.block_ranges) == 1
-    assert plan.block_ranges[0].req_id == "r1"
-    assert plan.block_ranges[0].block_hashes == [b"h0", b"h1", b"h2"]
-    assert plan.block_ranges[0].gpu_block_ids == [11, 12, 13]
+    assert plan.block_ranges[0].req_id.startswith(PREFETCH_POOL_REQ_ID)
+    assert plan.block_ranges[0].block_hashes == [b"h0", b"h1"]
+    assert plan.block_ranges[0].gpu_block_ids == [100, 101]
+    assert manager.prefetch_allocations == [("wf0", "a0", [b"h0", b"h1"])]

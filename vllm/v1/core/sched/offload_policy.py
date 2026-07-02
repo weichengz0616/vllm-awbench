@@ -676,37 +676,37 @@ class KVFlowOffloadPolicy(BaseAgentOffloadPolicy):
 class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
     """Tokencake-specific offload policy hook.
 
-    Event-driven implementation of Tokencake's time scheduler.
+    This implements Tokencake's request-finish time scheduler using only
+    request metadata. A request becomes a Tokencake candidate when its metadata
+    says that the next op is a tool and that a later request in the same
+    session can reuse its KV cache. Candidate requests are split into three
+    finish actions:
 
-    ReAct programs are modeled as a single looping agent with many sessions.
-    A session can span multiple requests and its KV hashes grow monotonically.
-    Function-call events are carried by request metadata:
-    ``function_event=call_start`` opens a stall window and may offload that
-    session's idle KV; ``function_event=call_finish`` or a predicted finish
-    deadline causes the matching session hashes to be loaded before the agent
-    resumes.
+    * NORMAL: non-candidates follow normal vLLM lifetime management.
+    * PIN: short or unprofitable tool stalls retain GPU KV blocks.
+    * OFFLOAD: profitable stalls store KV blocks to CPU, then release GPU KV.
     """
 
     DEFAULT_CALL_DURATION_SECS = 1.0
     DEFAULT_TOKENS_PER_SEC = 2048.0
     DEFAULT_TRANSFER_SECS_PER_BLOCK = 0.00001
     DEFAULT_TRANSFER_SECS = 0.002
+    DEFAULT_PIN_TIMEOUT_SECS = 30.0
+
+    FINISH_NORMAL = "normal"
+    FINISH_PIN = "pin"
+    FINISH_OFFLOAD = "offload"
 
     @dataclass
-    class CallInfo:
-        name: str
-        duration: float
-
-    @dataclass
-    class ActiveCall:
+    class ActiveStall:
         request_id: str
-        call_name: str
+        tool_name: str
         start_time: float
         predicted_duration: float
         num_blocks: int
-        offload_requested: bool = False
+        action: str
+        deadline: float
         load_requested: bool = False
-        finished: bool = False
 
         @property
         def predicted_finish_time(self) -> float:
@@ -715,8 +715,12 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
     @dataclass
     class SessionState:
         hash_list: list[BlockHash] = field(default_factory=list)
-        active_call: "TokencakeOffloadPolicy.ActiveCall | None" = None
+        agent_id: str | None = None
+        workflow_id: str | None = None
+        active_stall: "TokencakeOffloadPolicy.ActiveStall | None" = None
         stored_blocks: int = 0
+        pinned_request_id: str | None = None
+        pending_offload_request_id: str | None = None
 
     @dataclass
     class ProgramState:
@@ -724,24 +728,18 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         sessions: dict[str, "TokencakeOffloadPolicy.SessionState"] = field(
             default_factory=dict
         )
-        call_infos: dict[str, "TokencakeOffloadPolicy.CallInfo"] = field(
-            default_factory=dict
-        )
 
     def __init__(self):
         super().__init__()
         self._programs: dict[str, TokencakeOffloadPolicy.ProgramState] = {}
         self._request_session_keys: dict[str, tuple[str, str]] = {}
+        self._pending_finished_offloads: set[str] = set()
 
     def _session_key(self, req: Request) -> tuple[str, str] | None:
         metadata = self._metadata(req)
-        if metadata.program_id is None:
+        if metadata.program_id is None or metadata.session_id is None:
             return None
-        program_type = (metadata.program_type or "").lower()
-        if program_type != "react":
-            return None
-        session_id = metadata.session_id or req.request_id
-        return (metadata.program_id, session_id)
+        return (metadata.program_id, metadata.session_id)
 
     def _get_program_state(
         self, req: Request
@@ -769,106 +767,150 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         if program is None:
             return None
         self._request_session_keys[req.request_id] = key
-        return program.sessions.setdefault(
+        session = program.sessions.setdefault(
             key[1], TokencakeOffloadPolicy.SessionState()
         )
-
-    def _call_name(self, req: Request) -> str:
         metadata = self._metadata(req)
-        return metadata.call_name or "default"
+        session.agent_id = metadata.agent_id or session.agent_id
+        session.workflow_id = metadata.workflow_key or session.workflow_id
+        return session
 
-    def _call_duration(self, req: Request) -> float:
+    def _is_stall_candidate(self, req: Request) -> bool:
         metadata = self._metadata(req)
-        duration = (
-            metadata.call_duration
-            if metadata.call_duration is not None
-            else metadata.predicted_tool_time
+        return (
+            metadata.next_op_type == "tool"
+            and metadata.multi_turn_kv_reuse
+            and metadata.program_id is not None
+            and metadata.session_id is not None
         )
+
+    def _tool_name(self, req: Request) -> str:
+        metadata = self._metadata(req)
+        return metadata.next_tool_type or "tool"
+
+    def _predicted_duration(self, req: Request) -> float:
+        duration = self._metadata(req).predicted_tool_time
         if duration is None or duration <= 0:
             duration = self.DEFAULT_CALL_DURATION_SECS
         return duration
 
-    def _observe_request(self, req: Request, now: float) -> None:
+    def _observe_request_hashes(self, req: Request) -> None:
         session = self._get_session_state(req)
         if session is None:
             return
-
         if len(req.block_hashes) > len(session.hash_list):
             session.hash_list = list(req.block_hashes)
 
-        metadata = self._metadata(req)
-        call_name = self._call_name(req)
-        program = self._get_program_state(req)
-        if program is not None:
-            program.call_infos[call_name] = TokencakeOffloadPolicy.CallInfo(
-                name=call_name,
-                duration=self._call_duration(req),
-            )
+    def _offloaded_hashes(
+        self,
+        hash_list: list[BlockHash],
+        state: OffloadPolicyState,
+    ) -> list[BlockHash]:
+        if state.block_size_factor <= 1:
+            return list(hash_list)
+        return list(hash_list[state.block_size_factor - 1 :: state.block_size_factor])
 
-        if metadata.function_event == "call_start":
-            session.active_call = TokencakeOffloadPolicy.ActiveCall(
-                request_id=req.request_id,
-                call_name=call_name,
-                start_time=now,
-                predicted_duration=self._call_duration(req),
-                num_blocks=len(session.hash_list),
-            )
-            logger.info(
-                "awbench ---- Tokencake observed call_start: request_id=%s program_id=%s "
-                "session_id=%s call_name=%s predicted_duration=%.6f "
-                "num_session_blocks=%d",
-                req.request_id,
-                metadata.program_id,
-                metadata.session_id or req.request_id,
-                call_name,
-                session.active_call.predicted_duration,
-                len(session.hash_list),
-            )
-        elif metadata.function_event == "call_finish":
-            if session.active_call is None:
-                session.active_call = TokencakeOffloadPolicy.ActiveCall(
-                    request_id=req.request_id,
-                    call_name=call_name,
-                    start_time=now,
-                    predicted_duration=0,
-                    num_blocks=len(session.hash_list),
-                )
-            session.active_call.finished = True
-            logger.info(
-                "awbench ---- Tokencake observed call_finish: request_id=%s program_id=%s "
-                "session_id=%s call_name=%s num_session_blocks=%d",
-                req.request_id,
-                metadata.program_id,
-                metadata.session_id or req.request_id,
-                call_name,
-                len(session.hash_list),
-            )
-
-    def _observe_requests(self, requests: list[Request], now: float) -> None:
-        seen: set[str] = set()
-        for req in requests:
-            if req.request_id in seen:
-                continue
-            seen.add(req.request_id)
-            self._observe_request(req, now)
-
-    def _estimate_transfer_time(self, num_blocks: int) -> float:
+    def _estimate_one_way_transfer_time(self, num_blocks: int) -> float:
         return self.DEFAULT_TRANSFER_SECS + (
             num_blocks * self.DEFAULT_TRANSFER_SECS_PER_BLOCK
         )
 
+    def _estimate_round_trip_transfer_time(self, num_blocks: int) -> float:
+        return 2 * self._estimate_one_way_transfer_time(num_blocks)
+
     def _has_best_fit_waiting_request(
         self,
-        context: OffloadDecisionContext,
-        active_call: "TokencakeOffloadPolicy.ActiveCall",
+        waiting: list[Request],
+        predicted_duration: float,
+        num_blocks: int,
     ) -> bool:
-        transfer_time = self._estimate_transfer_time(active_call.num_blocks)
-        if active_call.predicted_duration <= transfer_time:
+        transfer_time = self._estimate_round_trip_transfer_time(num_blocks)
+        if predicted_duration <= transfer_time:
             return False
         token_capacity = (
-            active_call.predicted_duration - transfer_time
+            predicted_duration - transfer_time
         ) * self.DEFAULT_TOKENS_PER_SEC
-        return any(req.num_tokens <= token_capacity for req in context.waiting)
+        return any(req.num_tokens <= token_capacity for req in waiting)
+
+    def on_request_finished(
+        self,
+        request: Request,
+        offload_state: OffloadPolicyState | None,
+        waiting: list[Request],
+        now: float,
+    ) -> str:
+        """Classify a finished request into normal, pinned, or offloaded."""
+        self._observe_request_hashes(request)
+        if not self._is_stall_candidate(request):
+            return self.FINISH_NORMAL
+
+        session = self._get_session_state(request)
+        if session is None:
+            return self.FINISH_NORMAL
+
+        predicted_duration = self._predicted_duration(request)
+        pin_deadline = now + max(
+            self.DEFAULT_PIN_TIMEOUT_SECS,
+            2 * predicted_duration,
+        )
+        num_blocks = 0
+        if offload_state is not None:
+            num_blocks = len(session.hash_list) // offload_state.block_size_factor
+
+        action = self.FINISH_PIN
+        if (
+            offload_state is not None
+            and num_blocks > 0
+            and self._has_best_fit_waiting_request(
+                waiting, predicted_duration, num_blocks
+            )
+        ):
+            action = self.FINISH_OFFLOAD
+
+        session.active_stall = TokencakeOffloadPolicy.ActiveStall(
+            request_id=request.request_id,
+            tool_name=self._tool_name(request),
+            start_time=now,
+            predicted_duration=predicted_duration,
+            num_blocks=num_blocks,
+            action=action,
+            deadline=pin_deadline,
+        )
+
+        metadata = self._metadata(request)
+        if action == self.FINISH_OFFLOAD:
+            session.pending_offload_request_id = request.request_id
+            session.pinned_request_id = None
+            self._pending_finished_offloads.add(request.request_id)
+            logger.info(
+                "awbench ---- Tokencake finish action=offload: request_id=%s "
+                "program_id=%s session_id=%s tool=%s predicted_duration=%.6f "
+                "num_blocks=%d waiting=%d",
+                request.request_id,
+                metadata.program_id,
+                metadata.session_id,
+                session.active_stall.tool_name,
+                predicted_duration,
+                num_blocks,
+                len(waiting),
+            )
+            return self.FINISH_OFFLOAD
+
+        session.pinned_request_id = request.request_id
+        session.pending_offload_request_id = None
+        logger.info(
+            "awbench ---- Tokencake finish action=pin: request_id=%s "
+            "program_id=%s session_id=%s tool=%s predicted_duration=%.6f "
+            "num_blocks=%d waiting=%d",
+            request.request_id,
+            metadata.program_id,
+            metadata.session_id,
+            session.active_stall.tool_name,
+            predicted_duration,
+            num_blocks,
+            len(waiting),
+        )
+        return self.FINISH_PIN
 
     def get_load_plan(self, context: LoadDecisionContext) -> KVLoadPlan:
         state = context.offload_state
@@ -876,88 +918,68 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         if state is None:
             return default_plan
 
-        self._observe_requests(
-            [info.request for info in context.request_infos]
-            + context.scheduled_requests,
-            context.now,
-        )
+        for request_info in context.request_infos:
+            self._observe_request_hashes(request_info.request)
+        for request in context.scheduled_requests:
+            self._observe_request_hashes(request)
 
         block_ranges: list[KVBlockRange] = []
-        for request_info in context.request_infos:
-            request = request_info.request
-            session = self._get_session_state(request)
-            if session is None or session.active_call is None:
-                continue
-            active_call = session.active_call
-            upload_time = self._estimate_transfer_time(len(session.hash_list))
-            should_load = active_call.finished or (
-                context.now + upload_time >= active_call.predicted_finish_time
-            )
-            if not should_load or active_call.load_requested:
-                continue
-            if (
-                request_info.allocated_blocks is None
-                or not request_info.load_kv_async
-            ):
-                continue
+        if context.lookup_block_hashes is not None:
+            for program_id, program in self._programs.items():
+                for session_id, session in program.sessions.items():
+                    active_stall = session.active_stall
+                    if (
+                        active_stall is None
+                        or active_stall.action != self.FINISH_OFFLOAD
+                        or active_stall.load_requested
+                        or session.stored_blocks <= 0
+                    ):
+                        continue
+                    upload_time = self._estimate_one_way_transfer_time(
+                        session.stored_blocks
+                    )
+                    if context.now + upload_time < active_stall.predicted_finish_time:
+                        continue
 
-            hash_list = session.hash_list
-            if state.block_size_factor > 1:
-                hash_list = hash_list[
-                    state.block_size_factor - 1 :: state.block_size_factor
-                ]
-            if not hash_list:
-                continue
-
-            start_block_idx = min(
-                request_info.num_local_computed_tokens
-                // state.offloaded_block_size,
-                len(hash_list),
-            )
-            if start_block_idx == len(hash_list):
-                active_call.load_requested = True
-                continue
-
-            block_ids = request_info.allocated_blocks.get_block_ids()[0]
-            num_computed_gpu_blocks = sum(
-                block.block_hash is not None
-                for block in request_info.allocated_blocks.blocks[0]
-            )
-            num_blocks = min(
-                len(hash_list) - start_block_idx,
-                len(block_ids) - num_computed_gpu_blocks,
-            )
-            if num_blocks <= 0:
-                continue
-
-            block_ranges.append(
-                KVBlockRange(
-                    req_id=request.request_id,
-                    start_block_idx=start_block_idx,
-                    num_blocks=num_blocks,
-                    block_hashes=hash_list[
-                        start_block_idx : start_block_idx + num_blocks
-                    ],
-                    gpu_block_ids=block_ids[
-                        num_computed_gpu_blocks : num_computed_gpu_blocks
-                        + num_blocks
-                    ],
-                )
-            )
-            active_call.load_requested = True
-            metadata = self._metadata(request)
-            logger.info(
-                "awbench ---- Tokencake planned KV load: request_id=%s program_id=%s "
-                "session_id=%s call_name=%s start_block_idx=%d num_blocks=%d "
-                "finished=%s",
-                request.request_id,
-                metadata.program_id,
-                metadata.session_id or request.request_id,
-                active_call.call_name,
-                start_block_idx,
-                num_blocks,
-                active_call.finished,
-            )
+                    block_hashes = self._offloaded_hashes(session.hash_list, state)[
+                        : session.stored_blocks
+                    ]
+                    ready_blocks = context.lookup_block_hashes(block_hashes)
+                    if ready_blocks is None or ready_blocks <= 0:
+                        continue
+                    block_hashes_to_load = block_hashes[:ready_blocks]
+                    workflow_id = session.workflow_id or program_id
+                    agent_id = session.agent_id or session_id
+                    allocated_blocks = context.kv_cache_manager.allocate_prefetch_blocks(
+                        workflow_id=workflow_id,
+                        agent_id=agent_id,
+                        block_hashes=block_hashes_to_load,
+                    )
+                    if allocated_blocks is None:
+                        continue
+                    gpu_block_ids = allocated_blocks.get_block_ids()[0]
+                    prefetch_req_id = allocated_blocks.request_id or PREFETCH_POOL_REQ_ID
+                    block_ranges.append(
+                        KVBlockRange(
+                            req_id=prefetch_req_id,
+                            start_block_idx=0,
+                            num_blocks=len(block_hashes_to_load),
+                            block_hashes=block_hashes_to_load,
+                            gpu_block_ids=gpu_block_ids,
+                            workflow_id=workflow_id,
+                            agent_id=agent_id,
+                        )
+                    )
+                    active_stall.load_requested = True
+                    logger.info(
+                        "awbench ---- Tokencake planned predictive KV load: "
+                        "request_id=%s program_id=%s session_id=%s num_blocks=%d",
+                        prefetch_req_id,
+                        program_id,
+                        session_id,
+                        len(block_hashes_to_load),
+                    )
+                    break
 
         seen = {
             (block_range.req_id, block_range.start_block_idx, block_range.num_blocks)
@@ -984,43 +1006,21 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         if state is None:
             return KVOffloadPlan()
 
-        scheduled_event_reqs = [
-            context.requests[req_id]
-            for req_id, _, _ in self._iter_scheduled_req_data(
-                context.scheduler_output
-            )
-            if req_id in context.requests
-        ]
-        self._observe_requests(
-            context.running + context.waiting + context.scheduled_requests
-            + scheduled_event_reqs,
-            context.now,
-        )
-
         block_ranges: list[KVBlockRange] = []
-        candidates = context.running + context.scheduled_requests + scheduled_event_reqs
-        seen_reqs: set[str] = set()
-        for req in candidates:
-            if req.request_id in seen_reqs:
+        for req_id in sorted(self._pending_finished_offloads):
+            req = context.requests.get(req_id)
+            if req is None:
+                self._pending_finished_offloads.discard(req_id)
                 continue
-            seen_reqs.add(req.request_id)
-            session = self._get_session_state(req)
-            if session is None or session.active_call is None:
+            session_key = self._request_session_keys.get(req_id)
+            if session_key is None:
                 continue
-            active_call = session.active_call
-            if active_call.request_id != req.request_id:
+            program = self._programs.get(session_key[0])
+            session = program.sessions.get(session_key[1]) if program else None
+            if session is None or session.active_stall is None:
                 continue
-            if active_call.offload_requested:
-                continue
-            if not self._has_best_fit_waiting_request(context, active_call):
-                continue
-
-            total_tokens = req.num_computed_tokens + (
-                context.scheduler_output.num_scheduled_tokens.get(req.request_id, 0)
-            )
             total_blocks = min(
-                self._num_full_blocks_for_tokens(total_tokens, state),
-                len(req.block_hashes) // state.block_size_factor,
+                session.active_stall.num_blocks,
                 len(session.hash_list) // state.block_size_factor,
             )
             start_block_idx = min(session.stored_blocks, total_blocks)
@@ -1029,15 +1029,13 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
             )
             if block_range is not None:
                 block_ranges.append(block_range)
-                active_call.offload_requested = True
-                metadata = self._metadata(req)
                 logger.info(
-                    "awbench ---- Tokencake planned KV offload: request_id=%s program_id=%s "
-                    "session_id=%s call_name=%s start_block_idx=%d num_blocks=%d",
+                    "awbench ---- Tokencake planned finished KV offload: "
+                    "request_id=%s program_id=%s session_id=%s "
+                    "start_block_idx=%d num_blocks=%d",
                     req.request_id,
-                    metadata.program_id,
-                    metadata.session_id or req.request_id,
-                    active_call.call_name,
+                    session_key[0],
+                    session_key[1],
                     block_range.start_block_idx,
                     block_range.num_blocks,
                 )
@@ -1048,6 +1046,16 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
         super().update_after_connector_meta(transfer_plan)
         if transfer_plan is None:
             return
+
+        planned_offload_keys = {
+            (block_range.req_id, block_range.start_block_idx, block_range.num_blocks)
+            for offload_plan in transfer_plan.offloads
+            for block_range in offload_plan.block_ranges
+        }
+        prepared_offload_keys = {
+            (block_range.req_id, block_range.start_block_idx, block_range.num_blocks)
+            for block_range in transfer_plan.prepared_offload_ranges
+        }
 
         for block_range in transfer_plan.prepared_offload_ranges:
             session_key = self._request_session_keys.get(block_range.req_id)
@@ -1063,6 +1071,12 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
                 session.stored_blocks,
                 block_range.start_block_idx + block_range.num_blocks,
             )
+            if (
+                session.active_stall is not None
+                and session.stored_blocks >= session.active_stall.num_blocks
+            ):
+                self._pending_finished_offloads.discard(block_range.req_id)
+                session.pending_offload_request_id = None
             logger.info(
                 "awbench ---- Tokencake committed prepared KV offload: request_id=%s "
                 "program_id=%s session_id=%s stored_blocks=%d",
@@ -1070,6 +1084,31 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
                 session_key[0],
                 session_key[1],
                 session.stored_blocks,
+            )
+
+        failed_offload_req_ids = {
+            req_id
+            for req_id, start_idx, num_blocks in planned_offload_keys
+            if (req_id, start_idx, num_blocks) not in prepared_offload_keys
+        }
+        for req_id in failed_offload_req_ids:
+            session_key = self._request_session_keys.get(req_id)
+            if session_key is None:
+                continue
+            program = self._programs.get(session_key[0])
+            session = program.sessions.get(session_key[1]) if program else None
+            if session is None or session.active_stall is None:
+                continue
+            self._pending_finished_offloads.discard(req_id)
+            session.pending_offload_request_id = None
+            session.pinned_request_id = req_id
+            session.active_stall.action = self.FINISH_PIN
+            logger.info(
+                "awbench ---- Tokencake falling back to GPU pin after failed "
+                "offload preparation: request_id=%s program_id=%s session_id=%s",
+                req_id,
+                session_key[0],
+                session_key[1],
             )
 
         for block_range in transfer_plan.prepared_load_ranges:
@@ -1080,8 +1119,8 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
             if program is None:
                 continue
             session = program.sessions.get(session_key[1])
-            if session is not None and session.active_call is not None:
-                session.active_call.load_requested = True
+            if session is not None and session.active_stall is not None:
+                session.active_stall.load_requested = True
                 logger.info(
                     "awbench ---- Tokencake committed prepared KV load: request_id=%s "
                     "program_id=%s session_id=%s",
@@ -1090,14 +1129,98 @@ class TokencakeOffloadPolicy(BaseAgentOffloadPolicy):
                     session_key[1],
                 )
 
+    def take_pinned_releases_for_scheduled(
+        self, scheduled_requests: list[Request]
+    ) -> list[str]:
+        release_req_ids: list[str] = []
+        for request in scheduled_requests:
+            session_key = self._session_key(request)
+            if session_key is None:
+                continue
+            program = self._programs.get(session_key[0])
+            session = program.sessions.get(session_key[1]) if program else None
+            if session is None or session.active_stall is None:
+                continue
+            if (
+                session.active_stall.action == self.FINISH_OFFLOAD
+                and session.active_stall.request_id != request.request_id
+            ):
+                logger.info(
+                    "awbench ---- Tokencake observed offloaded session resume: "
+                    "producer_request_id=%s consumer_request_id=%s "
+                    "program_id=%s session_id=%s",
+                    session.active_stall.request_id,
+                    request.request_id,
+                    session_key[0],
+                    session_key[1],
+                )
+                session.active_stall = None
+                session.stored_blocks = 0
+                continue
+            if session.pinned_request_id is None:
+                continue
+            if session.pinned_request_id == request.request_id:
+                continue
+            release_req_ids.append(session.pinned_request_id)
+            logger.info(
+                "awbench ---- Tokencake releasing pinned producer after "
+                "consumer schedule: producer_request_id=%s consumer_request_id=%s "
+                "program_id=%s session_id=%s",
+                session.pinned_request_id,
+                request.request_id,
+                session_key[0],
+                session_key[1],
+            )
+            session.pinned_request_id = None
+            session.active_stall = None
+        return release_req_ids
+
+    def take_expired_pinned_requests(self, now: float) -> list[str]:
+        release_req_ids: list[str] = []
+        for program_id, program in list(self._programs.items()):
+            for session_id, session in list(program.sessions.items()):
+                active_stall = session.active_stall
+                if (
+                    active_stall is None
+                    or session.pinned_request_id is None
+                    or active_stall.deadline > now
+                ):
+                    continue
+                release_req_ids.append(session.pinned_request_id)
+                logger.info(
+                    "awbench ---- Tokencake releasing expired GPU pin: "
+                    "request_id=%s program_id=%s session_id=%s",
+                    session.pinned_request_id,
+                    program_id,
+                    session_id,
+                )
+                session.pinned_request_id = None
+                session.active_stall = None
+        return release_req_ids
+
+    def num_pending_finished_offloads(self) -> int:
+        return len(self._pending_finished_offloads)
+
     def request_finished(self, request: Request):
         super().request_finished(request)
-        metadata = self._metadata(request)
         session_key = self._request_session_keys.pop(request.request_id, None)
         if session_key is None:
             return
         program = self._programs.get(session_key[0])
         if program is None:
+            return
+        session = program.sessions.get(session_key[1])
+        if session is not None:
+            if session.pinned_request_id == request.request_id:
+                session.pinned_request_id = None
+            if session.pending_offload_request_id == request.request_id:
+                session.pending_offload_request_id = None
+                self._pending_finished_offloads.discard(request.request_id)
+        if session is not None and (
+            session.pinned_request_id is not None
+            or session.pending_offload_request_id is not None
+            or session.active_stall is not None
+        ):
             return
         program.sessions.pop(session_key[1], None)
         if not program.sessions:

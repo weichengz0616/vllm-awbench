@@ -395,7 +395,9 @@ class Scheduler(SchedulerInterface):
         return num_new_tokens
 
     def schedule(self) -> SchedulerOutput:
-        self._cachettl_expire_pinned_requests(time.monotonic())
+        now = time.monotonic()
+        self._cachettl_expire_pinned_requests(now)
+        self._tokencake_release_expired_pins(now)
 
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1091,6 +1093,8 @@ class Scheduler(SchedulerInterface):
             self.offload_policy.update_after_connector_meta(
                 scheduler_output.offload_plan
             )
+
+        self._tokencake_release_pinned_after_schedule(scheduled_requests)
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -1927,12 +1931,21 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        if isinstance(self.offload_policy, TokencakeOffloadPolicy):
+            action = self.offload_policy.on_request_finished(
+                request=request,
+                offload_state=self._get_offload_policy_state(),
+                waiting=list(self.waiting),
+                now=time.monotonic(),
+            )
+            if action != TokencakeOffloadPolicy.FINISH_NORMAL:
+                self.encoder_cache_manager.free(request)
+                self._mark_request_finished_for_workers(request)
+                return None
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
-        request_id = request.request_id
-        self.finished_req_ids.add(request_id)
-        if self.finished_req_ids_dict is not None:
-            self.finished_req_ids_dict[request.client_index].add(request_id)
+        self._mark_request_finished_for_workers(request)
 
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
@@ -1941,8 +1954,35 @@ class Scheduler(SchedulerInterface):
 
         return kv_xfer_params
 
+    def _mark_request_finished_for_workers(self, request: Request) -> None:
+        request_id = request.request_id
+        self.finished_req_ids.add(request_id)
+        if self.finished_req_ids_dict is not None:
+            self.finished_req_ids_dict[request.client_index].add(request_id)
+
+    def _tokencake_release_expired_pins(self, now: float) -> None:
+        if not isinstance(self.offload_policy, TokencakeOffloadPolicy):
+            return
+        for req_id in self.offload_policy.take_expired_pinned_requests(now):
+            request = self.requests.get(req_id)
+            if request is not None and request.is_finished():
+                self._free_blocks(request)
+
+    def _tokencake_release_pinned_after_schedule(
+        self, scheduled_requests: list[Request]
+    ) -> None:
+        if not isinstance(self.offload_policy, TokencakeOffloadPolicy):
+            return
+        for req_id in self.offload_policy.take_pinned_releases_for_scheduled(
+            scheduled_requests
+        ):
+            request = self.requests.get(req_id)
+            if request is not None and request.is_finished():
+                self._free_blocks(request)
+
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self.offload_policy.request_finished(request)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
@@ -1965,7 +2005,7 @@ class Scheduler(SchedulerInterface):
             return False
         metadata = request.kv_cache_policy_metadata
         program_id = self._cachettl_program_id(request)
-        if program_id is None or metadata.is_program_done:
+        if program_id is None:
             return False
         ttl_seconds = (
             metadata.ttl_seconds
@@ -2095,7 +2135,10 @@ class Scheduler(SchedulerInterface):
 
     def get_num_unfinished_requests(self) -> int:
         num_waiting = len(self.waiting) - self.num_waiting_for_streaming_input
-        return num_waiting + len(self.running)
+        num_unfinished = num_waiting + len(self.running)
+        if isinstance(self.offload_policy, TokencakeOffloadPolicy):
+            num_unfinished += self.offload_policy.num_pending_finished_offloads()
+        return num_unfinished
 
     def has_finished_requests(self) -> bool:
         return len(self.finished_req_ids) > 0

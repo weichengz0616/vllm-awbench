@@ -19,6 +19,7 @@ KVBlockStatus = Literal["gpu", "cpu", "loading", "offloading", "reserved"]
 KVPoolClass = Literal["shared", "reserved"]
 AgentKVEvictionPolicy = Literal["lru", "cachettl", "kvflow", "tokencake"]
 ProgramType = Literal["dag", "react"]
+NextOpType = Literal["tool", "llm", "done"]
 
 
 @dataclass
@@ -52,6 +53,7 @@ class KVRequestPolicyMetadata:
     program_id: str | None = None
     program_type: ProgramType | None = None
     agent_id: str | None = None
+    op_id: str | None = None
     fixed_prefix_len: int | None = None
 
     # KVFlow-specific metadata.
@@ -61,12 +63,14 @@ class KVRequestPolicyMetadata:
     # Kept for compatibility with existing request metadata plumbing.
     ttl_seconds: float | None = None
     critical: bool = False
+
+    # Tokencake-specific metadata.
     session_id: str | None = None
+    next_op_type: NextOpType | None = None
+    next_tool_type: str | None = None
     predicted_tool_time: float | None = None
-    call_name: str | None = None
-    call_duration: float | None = None
-    function_event: Literal["call_start", "call_finish"] | None = None
-    is_program_done: bool = False
+    multi_turn_kv_reuse: bool = False
+    static_priority: float | None = None
 
     @classmethod
     def from_extra_args(
@@ -107,6 +111,7 @@ class KVRequestPolicyMetadata:
             program_id=_as_str(raw.get("program_id")),
             program_type=program_type if program_type in ("dag", "react") else None,
             agent_id=_as_str(raw.get("agent_id")),
+            op_id=_as_str(raw.get("op_id")),
             fixed_prefix_len=_as_int(raw.get("fixed_prefix_len")),
             agent_steps_to_execution={
                 str(k): float(v)
@@ -117,27 +122,27 @@ class KVRequestPolicyMetadata:
             ttl_seconds=_as_float(raw.get("ttl_seconds")),
             critical=bool(raw.get("critical", False)),
             session_id=_as_str(raw.get("session_id")),
+            next_op_type=raw.get("next_op_type")
+            if raw.get("next_op_type") in ("tool", "llm", "done")
+            else None,
+            next_tool_type=_as_str(
+                raw.get("next_tool_type")
+                or raw.get("tool_type")
+                or raw.get("tool_name")
+            ),
             predicted_tool_time=_as_float(
                 raw.get("predicted_tool_time")
                 if raw.get("predicted_tool_time") is not None
                 else raw.get("predict_time")
             ),
-            call_name=_as_str(raw.get("call_name") or raw.get("function_name")),
-            call_duration=_as_float(
-                raw.get("call_duration")
-                if raw.get("call_duration") is not None
-                else raw.get("predict_time")
-            ),
-            function_event=raw.get("function_event")
-            if raw.get("function_event") in ("call_start", "call_finish")
-            else None,
-            is_program_done=bool(
+            multi_turn_kv_reuse=bool(
                 _as_bool(
-                    raw.get("is_program_done")
-                    if raw.get("is_program_done") is not None
-                    else raw.get("program_done")
+                    raw.get("multi_turn_kv_reuse")
+                    if raw.get("multi_turn_kv_reuse") is not None
+                    else raw.get("kv_reuse_after_tool")
                 )
             ),
+            static_priority=_as_float(raw.get("static_priority")),
         )
 
     def step_for_agent(self, agent_id: str | None) -> float | None:
