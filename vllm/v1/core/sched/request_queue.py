@@ -15,6 +15,8 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    PLAS = "plas"    # sequential programs — additive service accumulation
+    ATLAS = "atlas"  # DAG programs — critical-path (max) service tracking
 
 
 class RequestQueue(ABC):
@@ -69,6 +71,11 @@ class RequestQueue(ABC):
     @abstractmethod
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to the policy."""
+        pass
+
+    @abstractmethod
+    def __reversed__(self) -> Iterator[Request]:
+        """Iterate over the queue in reverse order."""
         pass
 
 
@@ -126,6 +133,10 @@ class FCFSRequestQueue(deque[Request], RequestQueue):
     def __iter__(self) -> Iterator[Request]:
         """Iterate over the queue according to FCFS policy."""
         return super().__iter__()
+
+    def __reversed__(self) -> Iterator[Request]:
+        """Iterate over the queue in reverse order."""
+        return super().__reversed__()
 
 
 class PriorityRequestQueue(RequestQueue):
@@ -197,6 +208,92 @@ class PriorityRequestQueue(RequestQueue):
         while heap_copy:
             yield heapq.heappop(heap_copy)
 
+    def __reversed__(self) -> Iterator[Request]:
+        """Iterate over the queue in reverse priority order."""
+        return reversed(list(self))
+
+
+class MLFQRequestQueue(RequestQueue):
+    """Multi-Level Feedback Queue for PLAS scheduling (Autellix Algorithm 1).
+
+    Organises requests into K FCFS sub-queues indexed 0 (highest priority)
+    to K-1 (lowest priority).  pop_request() always returns from the
+    highest-priority non-empty sub-queue.
+
+    The scheduler drives level changes: new arrivals start at level 0;
+    assign_level() moves a request when the scheduler demotes or promotes it.
+    """
+
+    def __init__(self, num_levels: int = 4) -> None:
+        self.num_levels = num_levels
+        self._queues: list[deque[Request]] = [deque() for _ in range(num_levels)]
+        self._req_level: dict[str, int] = {}
+
+    def add_request(self, request: Request) -> None:
+        self._queues[0].append(request)
+        self._req_level[request.request_id] = 0
+
+    def pop_request(self) -> Request:
+        for q in self._queues:
+            if q:
+                req = q.popleft()
+                self._req_level.pop(req.request_id, None)
+                return req
+        raise IndexError("pop from empty MLFQRequestQueue")
+
+    def peek_request(self) -> Request:
+        for q in self._queues:
+            if q:
+                return q[0]
+        raise IndexError("peek from empty MLFQRequestQueue")
+
+    def prepend_request(self, request: Request) -> None:
+        level = self._req_level.get(request.request_id, 0)
+        self._queues[level].appendleft(request)
+        self._req_level[request.request_id] = level
+
+    def prepend_requests(self, requests: "RequestQueue") -> None:
+        for req in reversed(list(requests)):
+            self.prepend_request(req)
+
+    def remove_request(self, request: Request) -> None:
+        level = self._req_level.pop(request.request_id, None)
+        if level is not None:
+            self._queues[level].remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        to_remove = {r.request_id for r in requests}
+        for req_id in to_remove:
+            level = self._req_level.pop(req_id, None)
+            if level is not None:
+                self._queues[level] = deque(
+                    r for r in self._queues[level] if r.request_id != req_id
+                )
+
+    def assign_level(self, request: Request, level: int) -> None:
+        """Move a waiting request to a different MLFQ level."""
+        cur = self._req_level.get(request.request_id)
+        if cur is None:
+            return
+        self._queues[cur].remove(request)
+        target = min(max(level, 0), self.num_levels - 1)
+        self._queues[target].append(request)
+        self._req_level[request.request_id] = target
+
+    def __bool__(self) -> bool:
+        return any(q for q in self._queues)
+
+    def __len__(self) -> int:
+        return sum(len(q) for q in self._queues)
+
+    def __iter__(self) -> Iterator[Request]:
+        for q in self._queues:
+            yield from q
+
+    def __reversed__(self) -> Iterator[Request]:
+        """Iterate over the queue in reverse order."""
+        return reversed(list(self))
+
 
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
@@ -204,5 +301,7 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy in (SchedulingPolicy.PLAS, SchedulingPolicy.ATLAS):
+        return MLFQRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

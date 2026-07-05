@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -59,7 +59,11 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    MLFQRequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
@@ -72,6 +76,41 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# PLAS/ATLAS (Autellix Algorithm 1) — activated by --scheduling-policy plas|atlas.
+# No separate env flag needed; the queue policy drives the behaviour.
+
+_PLAS_NUM_LEVELS: int = 4
+# Service threshold (tokens) at which a new request enters each MLFQ level.
+_PLAS_SERVICE_THRESHOLDS: list[int] = [0, 512, 2048, 8192]
+# Per-level quantum (tokens): tokens a call may consume before demotion.
+_PLAS_QUANTA: list[int] = [512, 1024, 2048, 4096]
+# Anti-starvation: promote when accumulated_wait / accumulated_service >= β.
+_PLAS_STARVATION_BETA: float = 4.0
+
+
+@dataclass
+class ProgramData:
+    """ATLAS per-program state (Autellix Algorithm 1, Update_Process_Table).
+
+    service tracks the critical-path estimate: the longest chain of
+    (inherited_service + model_time) across all completed calls.  New calls
+    inherit this value, which groups parallel threads and prevents stragglers.
+    """
+
+    service: int = field(default=0)
+    wait: int = field(default=0)
+
+
+@dataclass
+class PLASRequestState:
+    """Per-request PLAS/ATLAS scheduling state."""
+
+    inherited_service: int  # program.service snapshot at arrival
+    level: int              # current MLFQ level
+    quanta: int             # remaining tokens at current level
+    model_time: int = field(default=0)
+    wait: int = field(default=0)
 
 
 @dataclass
@@ -206,6 +245,10 @@ class Scheduler(SchedulerInterface):
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
 
+        # ATLAS/PLAS per-program and per-request scheduling state
+        self._program_table: dict[str, ProgramData] = {}
+        self._plas_req_state: dict[str, PLASRequestState] = {}
+
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
         self.num_waiting_for_streaming_input: int = 0
@@ -314,6 +357,11 @@ class Scheduler(SchedulerInterface):
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
             )
+
+    @property
+    def _plas_enabled(self) -> bool:
+        """True when PLAS or ATLAS scheduling is active."""
+        return self.policy in (SchedulingPolicy.PLAS, SchedulingPolicy.ATLAS)
 
     def _get_offload_policy_state(self):
         if self.connector is None:
@@ -611,6 +659,8 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
+            if self._plas_enabled and self.waiting and token_budget > 0:
+                self._plas_apply_anti_starvation()
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -959,6 +1009,9 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        if self._plas_enabled:
+            self._plas_update_service(num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1871,6 +1924,20 @@ class Scheduler(SchedulerInterface):
             self._cachettl_on_request_arrive(request)
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
+            if self._plas_enabled:
+                prog_id = self._plas_program_id(request)
+                if prog_id not in self._program_table:
+                    self._program_table[prog_id] = ProgramData()
+                prog_service = self._program_table[prog_id].service
+                level = self._service_to_level(prog_service)
+                quanta = _PLAS_QUANTA[level]
+                self._plas_req_state[request.request_id] = PLASRequestState(
+                    inherited_service=prog_service,
+                    level=level,
+                    quanta=quanta,
+                )
+                if level > 0 and isinstance(self.waiting, MLFQRequestQueue):
+                    self.waiting.assign_level(request, level)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1931,6 +1998,9 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        if self._plas_enabled:
+            self._atlas_update_process_table(request.request_id)
+
         if isinstance(self.offload_policy, TokencakeOffloadPolicy):
             action = self.offload_policy.on_request_finished(
                 request=request,
@@ -1985,6 +2055,98 @@ class Scheduler(SchedulerInterface):
         self.offload_policy.request_finished(request)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    # ------------------------------------------------------------------
+    # PLAS helpers (Autellix Algorithm 1)
+    # ------------------------------------------------------------------
+
+    def _plas_program_id(self, request: Request) -> str:
+        """Unique-per-instance program key from awbench_meta, or request_id as fallback.
+
+        Uses workflow_id (unique per request instance) rather than program_id
+        (which is a template ID shared across all instances of the same program
+        type).  Each concurrent execution must have its own service counter.
+        """
+        extra = request.sampling_params.extra_args if request.sampling_params else None
+        if extra:
+            meta = extra.get("awbench_meta")
+            if isinstance(meta, dict):
+                wid = meta.get("workflow_id")
+                if wid:
+                    return str(wid)
+        return request.request_id
+
+    def _service_to_level(self, service: int) -> int:
+        """Map an inherited service value to an MLFQ level via fixed thresholds."""
+        for i in range(_PLAS_NUM_LEVELS - 1, 0, -1):
+            if service >= _PLAS_SERVICE_THRESHOLDS[i]:
+                return i
+        return 0
+
+    def _plas_apply_anti_starvation(self) -> None:
+        """Promote requests whose wait/service ratio exceeds β."""
+        promoted_req_ids: set[str] = set()
+        for req in self.waiting:
+            state = self._plas_req_state.get(req.request_id)
+            if state is None or state.level == 0:
+                if state is not None:
+                    state.wait += 1
+                continue
+            prog_id = self._plas_program_id(req)
+            prog = self._program_table.get(prog_id)
+            total_wait = (prog.wait if prog else 0) + state.wait
+            total_service = (prog.service if prog else 0) + state.model_time
+            state.wait += 1
+            if total_service > 0 and total_wait / total_service >= _PLAS_STARVATION_BETA:
+                state.level = 0
+                state.quanta = _PLAS_QUANTA[0]
+                state.wait = 0
+                state.model_time = 0
+                promoted_req_ids.add(req.request_id)
+        if promoted_req_ids and isinstance(self.waiting, MLFQRequestQueue):
+            for req in list(self.waiting):
+                if req.request_id in promoted_req_ids:
+                    self.waiting.assign_level(req, 0)
+
+    def _plas_update_service(self, num_scheduled_tokens: dict[str, int]) -> None:
+        """Consume quanta and demote requests that exhaust them."""
+        demoted: dict[str, int] = {}
+        for req_id, tokens in num_scheduled_tokens.items():
+            state = self._plas_req_state.get(req_id)
+            if state is None:
+                continue
+            state.model_time += tokens
+            state.quanta -= tokens
+            state.wait = 0
+            if state.quanta <= 0 and state.level < _PLAS_NUM_LEVELS - 1:
+                state.level += 1
+                state.quanta = _PLAS_QUANTA[state.level]
+                demoted[req_id] = state.level
+        if demoted and isinstance(self.waiting, MLFQRequestQueue):
+            for req in list(self.waiting):
+                if req.request_id in demoted:
+                    self.waiting.assign_level(req, demoted[req.request_id])
+
+    def _atlas_update_process_table(self, req_id: str) -> None:
+        """Update the program's service estimate when a request finishes.
+
+        PLAS (sequential): service = inherited + model_time  (additive)
+        ATLAS (DAG):       service = max(service, inherited + model_time)  (critical path)
+        """
+        state = self._plas_req_state.pop(req_id, None)
+        if state is None:
+            return
+        req = self.requests.get(req_id)
+        if req is None:
+            return
+        prog_id = self._plas_program_id(req)
+        prog = self._program_table.get(prog_id)
+        if prog is not None:
+            new_service = state.inherited_service + state.model_time
+            if self.policy == SchedulingPolicy.ATLAS:
+                prog.service = max(prog.service, new_service)
+            else:  # PLAS — sequential programs, additive
+                prog.service = new_service
 
     def _cachettl_program_id(self, request: Request) -> str | None:
         metadata = request.kv_cache_policy_metadata
