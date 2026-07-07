@@ -2169,9 +2169,11 @@ class Scheduler(SchedulerInterface):
         program_id = self._cachettl_program_id(request)
         if program_id is None:
             return False
+        if metadata.cachettl_should_pin is False or metadata.cachettl_is_last_step:
+            return False
         ttl_seconds = (
-            metadata.ttl_seconds
-            if metadata.ttl_seconds is not None
+            metadata.cachettl_ttl_seconds
+            if metadata.cachettl_ttl_seconds is not None
             else self.cache_config.cachettl_static_ttl_seconds
         )
         if ttl_seconds <= 0:

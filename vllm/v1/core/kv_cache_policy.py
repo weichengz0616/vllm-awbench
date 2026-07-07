@@ -60,8 +60,11 @@ class KVRequestPolicyMetadata:
     agent_steps_to_execution: dict[str, float] = field(default_factory=dict)
     next_agent_ids: list[str] = field(default_factory=list)
 
-    # Kept for compatibility with existing request metadata plumbing.
-    ttl_seconds: float | None = None
+    # CacheTTL-specific metadata.
+    cachettl_should_pin: bool | None = None
+    cachettl_ttl_seconds: float | None = None
+    cachettl_is_last_step: bool | None = None
+
     critical: bool = False
 
     # Tokencake-specific metadata.
@@ -119,7 +122,9 @@ class KVRequestPolicyMetadata:
                 if _is_number(v)
             },
             next_agent_ids=[str(agent_id) for agent_id in next_agent_ids],
-            ttl_seconds=_as_float(raw.get("ttl_seconds")),
+            cachettl_should_pin=_as_bool(raw.get("cachettl_should_pin")),
+            cachettl_ttl_seconds=_as_float(raw.get("cachettl_ttl_seconds")),
+            cachettl_is_last_step=_as_bool(raw.get("cachettl_is_last_step")),
             critical=bool(raw.get("critical", False)),
             session_id=_as_str(raw.get("session_id")),
             next_op_type=raw.get("next_op_type")
@@ -198,7 +203,7 @@ def align_fixed_prefix_len(
 
 
 def ttl_deadline(now: float, request_metadata: KVRequestPolicyMetadata) -> float | None:
-    ttl_seconds = request_metadata.ttl_seconds
+    ttl_seconds = request_metadata.cachettl_ttl_seconds
     if ttl_seconds is None or ttl_seconds <= 0:
         return None
     return now + ttl_seconds

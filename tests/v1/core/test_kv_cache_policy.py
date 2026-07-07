@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
+from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata, ttl_deadline
 from vllm.v1.core.kv_cache_manager import (
     KVCacheManager,
     MAX_INFLIGHT_PREFETCH_BATCHES,
@@ -213,6 +213,38 @@ def test_request_policy_metadata_parses_workflow_id():
     assert metadata.program_id == "program-instance"
     assert metadata.agent_id == "agent-a"
     assert metadata.workflow_key == "workflow-template"
+
+
+def test_request_policy_metadata_parses_cachettl_fields():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "awbench_meta": {
+                "program_id": "program-instance",
+                "cachettl_should_pin": True,
+                "cachettl_ttl_seconds": 1.5,
+                "cachettl_is_last_step": False,
+            }
+        }
+    )
+
+    assert metadata.program_id == "program-instance"
+    assert metadata.cachettl_should_pin is True
+    assert metadata.cachettl_ttl_seconds == 1.5
+    assert metadata.cachettl_is_last_step is False
+    assert ttl_deadline(10.0, metadata) == 11.5
+
+
+def test_request_policy_metadata_ignores_legacy_ttl_seconds():
+    metadata = KVRequestPolicyMetadata.from_extra_args(
+        {
+            "awbench_meta": {
+                "ttl_seconds": 99.0,
+            }
+        }
+    )
+
+    assert metadata.cachettl_ttl_seconds is None
+    assert ttl_deadline(10.0, metadata) is None
 
 
 def test_request_policy_metadata_accepts_external_template_id():
