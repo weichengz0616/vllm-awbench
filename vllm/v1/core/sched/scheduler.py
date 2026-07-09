@@ -737,11 +737,11 @@ class Scheduler(SchedulerInterface):
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
-                    logger.info(
-                        "awbench ---- Request waiting for KV prefetch: "
-                        "request_id=%s",
-                        request.request_id,
-                    )
+                    # logger.info(
+                    #     "awbench ---- Request waiting for KV prefetch: "
+                    #     "request_id=%s",
+                    #     request.request_id,
+                    # )
                     continue
 
                 num_external_computed_tokens = 0

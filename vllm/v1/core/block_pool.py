@@ -462,14 +462,14 @@ class BlockPool:
         metadata.prompt_part = "fixed"
         metadata.critical = False
         metadata.status = status  # type: ignore[assignment]
-        logger.info(
-            "awbench ---- Bound KV prefetch block metadata: block_id=%d "
-            "workflow_id=%s agent_id=%s status=%s",
-            block.block_id,
-            workflow_id,
-            agent_id,
-            status,
-        )
+        # logger.info(
+        #     "awbench ---- Bound KV prefetch block metadata: block_id=%d "
+        #     "workflow_id=%s agent_id=%s status=%s",
+        #     block.block_id,
+        #     workflow_id,
+        #     agent_id,
+        #     status,
+        # )
 
     def cache_prefetch_blocks(
         self,
@@ -489,14 +489,14 @@ class BlockPool:
             self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
             self.block_metadata[block.block_id].status = "gpu"
             self._maybe_record_agent_live_block(block, block_hash_with_group_id)
-            logger.info(
-                "awbench ---- Cached KV prefetched block: block_id=%d "
-                "block_hash=%s workflow_id=%s agent_id=%s",
-                block.block_id,
-                block_hash_with_group_id,
-                self.block_metadata[block.block_id].workflow_id,
-                self.block_metadata[block.block_id].agent_id,
-            )
+            # logger.info(
+            #     "awbench ---- Cached KV prefetched block: block_id=%d "
+            #     "block_hash=%s workflow_id=%s agent_id=%s",
+            #     block.block_id,
+            #     block_hash_with_group_id,
+            #     self.block_metadata[block.block_id].workflow_id,
+            #     self.block_metadata[block.block_id].agent_id,
+            # )
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """
@@ -524,16 +524,16 @@ class BlockPool:
             return False
 
         self._maybe_remove_agent_live_block(block, block_hash)
-        logger.info(
-            "awbench ---- Evicting cached KV block: block_id=%d block_hash=%s "
-            "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s",
-            block.block_id,
-            block_hash,
-            self.block_metadata[block.block_id].workflow_id,
-            self.block_metadata[block.block_id].program_id,
-            self.block_metadata[block.block_id].agent_id,
-            self.block_metadata[block.block_id].prompt_part,
-        )
+        # logger.info(
+        #     "awbench ---- Evicting cached KV block: block_id=%d block_hash=%s "
+        #     "workflow_id=%s program_id=%s agent_id=%s prompt_part=%s",
+        #     block.block_id,
+        #     block_hash,
+        #     self.block_metadata[block.block_id].workflow_id,
+        #     self.block_metadata[block.block_id].program_id,
+        #     self.block_metadata[block.block_id].agent_id,
+        #     self.block_metadata[block.block_id].prompt_part,
+        # )
         block.reset_hash()
 
         if self.enable_kv_cache_events:
@@ -614,15 +614,15 @@ class BlockPool:
         blocks_by_id = blocks_by_hash.setdefault(block_hash, {})
         already_recorded = block.block_id in blocks_by_id
         blocks_by_id[block.block_id] = block
-        if not already_recorded:
-            logger.info(
-                "awbench ---- Recorded live agent KV block: workflow_id=%s agent_id=%s "
-                "block_id=%d block_hash=%s",
-                workflow_id,
-                agent_id,
-                block.block_id,
-                block_hash,
-            )
+        # if not already_recorded:
+        #     logger.info(
+        #         "awbench ---- Recorded live agent KV block: workflow_id=%s agent_id=%s "
+        #         "block_id=%d block_hash=%s",
+        #         workflow_id,
+        #         agent_id,
+        #         block.block_id,
+        #         block_hash,
+        #     )
 
     def _maybe_remove_agent_live_block(
         self, block: KVCacheBlock, block_hash: BlockHashWithGroupId
@@ -634,14 +634,14 @@ class BlockPool:
             if block.block_id not in blocks_by_id:
                 continue
             blocks_by_id.pop(block.block_id, None)
-            logger.info(
-                "awbench ---- Removed live agent KV block: workflow_id=%s "
-                "agent_id=%s block_id=%d block_hash=%s",
-                agent_key[0],
-                agent_key[1],
-                block.block_id,
-                block_hash,
-            )
+            # logger.info(
+            #     "awbench ---- Removed live agent KV block: workflow_id=%s "
+            #     "agent_id=%s block_id=%d block_hash=%s",
+            #     agent_key[0],
+            #     agent_key[1],
+            #     block.block_id,
+            #     block_hash,
+            # )
             if not blocks_by_id:
                 blocks_by_hash.pop(block_hash, None)
             if not blocks_by_hash:

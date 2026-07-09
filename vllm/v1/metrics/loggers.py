@@ -1110,9 +1110,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Labeled prompt token counters by source
         pts = iteration_stats.prompt_token_stats
         for source in PromptTokenStats.ALL_SOURCES:
-            self.counter_prompt_tokens_by_source[source][engine_idx].inc(
-                pts.get_by_source(source)
-            )
+            try:
+                self.counter_prompt_tokens_by_source[source][engine_idx].inc(
+                    pts.get_by_source(source)
+                )
+            except Exception as e:
+                print(e)
+                logger.warning(
+                    "awbench ---- Failed to increment prompt token counter for source %s on engine %d, source value: %d",
+                    source,
+                    engine_idx,
+                    pts.get_by_source(source),
+                )
         self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
         self.counter_prompt_tokens_recomputed[engine_idx].inc(pts.recomputed_tokens)
         self.counter_generation_tokens[engine_idx].inc(
