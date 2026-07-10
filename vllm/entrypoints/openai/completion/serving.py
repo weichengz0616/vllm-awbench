@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     UsageInfo,
+    build_vllm_request_metrics,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -329,6 +330,7 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        final_res_batch: list[RequestOutput | None] = [None] * num_prompts
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -337,6 +339,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         try:
             async for prompt_idx, res in result_generator:
+                final_res_batch[prompt_idx] = res
                 prompt_token_ids = res.prompt_token_ids
                 prompt_logprobs = res.prompt_logprobs
 
@@ -447,6 +450,17 @@ class OpenAIServingCompletion(OpenAIServing):
                                 ),
                             )
                         ],
+                        vllm_request_metrics=(
+                            build_vllm_request_metrics(
+                                request_id,
+                                [res.metrics],
+                                requested_max_tokens=request.max_tokens,
+                                finish_reason=finish_reason,
+                                stop_reason=stop_reason,
+                            )
+                            if finish_reason is not None
+                            else None
+                        ),
                     )
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
@@ -473,13 +487,33 @@ class OpenAIServingCompletion(OpenAIServing):
                     cached_tokens=num_cached_tokens
                 )
 
-            if include_usage:
+            completed_responses = [
+                res for res in final_res_batch if res is not None
+            ]
+            if include_usage and completed_responses:
+                first_output = (
+                    completed_responses[0].outputs[0]
+                    if completed_responses[0].outputs
+                    else None
+                )
+                request_metrics = build_vllm_request_metrics(
+                    request_id,
+                    [res.metrics for res in completed_responses],
+                    requested_max_tokens=request.max_tokens,
+                    finish_reason=(
+                        first_output.finish_reason if first_output is not None else None
+                    ),
+                    stop_reason=(
+                        first_output.stop_reason if first_output is not None else None
+                    ),
+                )
                 final_usage_chunk = CompletionStreamResponse(
                     id=request_id,
                     created=created_time,
                     model=model_name,
                     choices=[],
                     usage=final_usage_info,
+                    vllm_request_metrics=request_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=False, exclude_none=True
@@ -603,12 +637,28 @@ class OpenAIServingCompletion(OpenAIServing):
         request_metadata.final_usage_info = usage
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
+        first_output = (
+            final_res_batch[0].outputs[0]
+            if final_res_batch and final_res_batch[0].outputs
+            else None
+        )
         return CompletionResponse(
             id=request_id,
             created=created_time,
             model=model_name,
             choices=choices,
             usage=usage,
+            vllm_request_metrics=build_vllm_request_metrics(
+                request_id,
+                [res.metrics for res in final_res_batch],
+                requested_max_tokens=request.max_tokens,
+                finish_reason=(
+                    first_output.finish_reason if first_output is not None else None
+                ),
+                stop_reason=(
+                    first_output.stop_reason if first_output is not None else None
+                ),
+            ),
             kv_transfer_params=kv_transfer_params,
         )
 

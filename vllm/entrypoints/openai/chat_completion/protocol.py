@@ -32,6 +32,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StructuralTagResponseFormat,
     ToolCall,
     UsageInfo,
+    VllmRequestMetrics,
     get_logits_processors,
 )
 from vllm.exceptions import VLLMValidationError
@@ -109,6 +110,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None
     num_kvcache_hit_tokens: int | None = None
+    vllm_request_metrics: VllmRequestMetrics | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
@@ -134,6 +136,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
     num_kvcache_hit_tokens: int | None = None
+    vllm_request_metrics: VllmRequestMetrics | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
