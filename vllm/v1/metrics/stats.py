@@ -212,6 +212,19 @@ class RequestStateStats:
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
+    # Per-request prompt token accounting. These mirror PromptTokenStats, but
+    # live for the lifetime of a request so serving frontends can expose a
+    # completed request's metrics without consulting aggregate Prometheus
+    # state.
+    num_prompt_tokens: int = 0
+    num_cached_tokens: int = 0
+    num_recomputed_tokens: int = 0
+    num_external_computed_tokens: int = 0
+
+    # Request-local scheduling and completion state.
+    num_preemptions: int = 0
+    finished_time: float = 0.0
+
 
 @dataclass
 class FinishedRequestStats:
@@ -342,6 +355,14 @@ class IterationStats:
                 prompt_len=prompt_len,
             )
 
+            recomputed = 1 if output.num_cached_tokens + 1 == prompt_len else 0
+            req_stats.num_prompt_tokens = prompt_len
+            req_stats.num_cached_tokens = output.num_cached_tokens
+            req_stats.num_recomputed_tokens = recomputed
+            req_stats.num_external_computed_tokens = (
+                output.num_external_computed_tokens
+            )
+
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
             req_stats.first_token_latency = first_token_latency
@@ -399,6 +420,7 @@ class IterationStats:
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                req_stats.num_preemptions += 1
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(
@@ -410,6 +432,7 @@ class IterationStats:
         num_cached_tokens: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
+        req_stats.finished_time = self.iteration_timestamp
 
         # Queued interval is from first QUEUED event to first SCHEDULED
         queued_time = req_stats.scheduled_ts - req_stats.queued_ts

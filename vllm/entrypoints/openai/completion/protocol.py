@@ -20,6 +20,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StreamOptions,
     StructuralTagResponseFormat,
     UsageInfo,
+    VllmRequestMetrics,
     get_logits_processors,
 )
 from vllm.exceptions import VLLMValidationError
@@ -445,6 +446,7 @@ class CompletionResponse(OpenAIBaseModel):
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
     system_fingerprint: str | None = None
     usage: UsageInfo
+    vllm_request_metrics: VllmRequestMetrics | None = None
 
     # vLLM-specific fields that are not in OpenAI spec
     kv_transfer_params: dict[str, Any] | None = Field(
@@ -478,3 +480,4 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: list[CompletionResponseStreamChoice]
     usage: UsageInfo | None = Field(default=None)
+    vllm_request_metrics: VllmRequestMetrics | None = None

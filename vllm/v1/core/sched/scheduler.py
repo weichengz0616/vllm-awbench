@@ -4,7 +4,7 @@ import itertools
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -45,7 +45,11 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
+from vllm.v1.core.sched.request_queue import (
+    MLFQRequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
@@ -58,6 +62,29 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+_PLAS_NUM_LEVELS: int = 4
+_PLAS_SERVICE_THRESHOLDS: list[int] = [0, 512, 2048, 8192]
+_PLAS_QUANTA: list[int] = [512, 1024, 2048, 4096]
+_PLAS_STARVATION_BETA: float = 4.0
+
+
+
+@dataclass
+class ProgramData:
+    service: int = field(default=0)
+    wait: int = field(default=0)
+
+
+
+@dataclass
+class PLASRequestState:
+    inherited_service: int
+    level: int
+    quanta: int
+    model_time: int = field(default=0)
+    wait: int = field(default=0)
 
 
 class Scheduler(SchedulerInterface):
@@ -163,6 +190,9 @@ class Scheduler(SchedulerInterface):
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
         self.finished_req_ids: set[str] = set()
+
+        self._program_table: dict[str, ProgramData] = {}
+        self._plas_req_state: dict[str, PLASRequestState] = {}
 
         # Counter for requests waiting for streaming input. Used to calculate
         # number of unfinished requests
@@ -270,6 +300,10 @@ class Scheduler(SchedulerInterface):
                 max_num_kv_tokens=self.max_num_kv_tokens,
                 vllm_config=self.vllm_config,
             )
+
+    @property
+    def _plas_enabled(self) -> bool:
+        return self.policy in (SchedulingPolicy.PLAS, SchedulingPolicy.ATLAS)
 
     def _mamba_block_aligned_split(
         self,
@@ -531,6 +565,8 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs:
+            if self._plas_enabled and self.waiting and token_budget > 0:
+                self._plas_apply_anti_starvation()
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
@@ -800,6 +836,9 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        if self._plas_enabled:
+            self._plas_update_service(num_scheduled_tokens)
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -1658,6 +1697,20 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
+            if self._plas_enabled:
+                prog_id = self._plas_program_id(request)
+                if prog_id not in self._program_table:
+                    self._program_table[prog_id] = ProgramData()
+                prog_service = self._program_table[prog_id].service
+                level = self._service_to_level(prog_service)
+                quanta = _PLAS_QUANTA[level]
+                self._plas_req_state[request.request_id] = PLASRequestState(
+                    inherited_service=prog_service,
+                    level=level,
+                    quanta=quanta,
+                )
+                if level > 0 and isinstance(self.waiting, MLFQRequestQueue):
+                    self.waiting.assign_level(request, level)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1718,6 +1771,9 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         assert request.is_finished()
 
+        if self._plas_enabled:
+            self._atlas_update_process_table(request.request_id)
+
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
@@ -1735,6 +1791,74 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def _plas_program_id(self, request: Request) -> str:
+        metadata = request.kv_cache_policy_metadata
+        return metadata.workflow_key or request.request_id
+
+    def _service_to_level(self, service: int) -> int:
+        for i in range(_PLAS_NUM_LEVELS - 1, 0, -1):
+            if service >= _PLAS_SERVICE_THRESHOLDS[i]:
+                return i
+        return 0
+
+    def _plas_apply_anti_starvation(self) -> None:
+        promoted_req_ids: set[str] = set()
+        for req in self.waiting:
+            state = self._plas_req_state.get(req.request_id)
+            if state is None or state.level == 0:
+                if state is not None:
+                    state.wait += 1
+                continue
+            prog_id = self._plas_program_id(req)
+            prog = self._program_table.get(prog_id)
+            total_wait = (prog.wait if prog else 0) + state.wait
+            total_service = (prog.service if prog else 0) + state.model_time
+            state.wait += 1
+            if total_service > 0 and total_wait / total_service >= _PLAS_STARVATION_BETA:
+                state.level = 0
+                state.quanta = _PLAS_QUANTA[0]
+                state.wait = 0
+                state.model_time = 0
+                promoted_req_ids.add(req.request_id)
+        if promoted_req_ids and isinstance(self.waiting, MLFQRequestQueue):
+            for req in list(self.waiting):
+                if req.request_id in promoted_req_ids:
+                    self.waiting.assign_level(req, 0)
+
+    def _plas_update_service(self, num_scheduled_tokens: dict[str, int]) -> None:
+        demoted: dict[str, int] = {}
+        for req_id, tokens in num_scheduled_tokens.items():
+            state = self._plas_req_state.get(req_id)
+            if state is None:
+                continue
+            state.model_time += tokens
+            state.quanta -= tokens
+            state.wait = 0
+            if state.quanta <= 0 and state.level < _PLAS_NUM_LEVELS - 1:
+                state.level += 1
+                state.quanta = _PLAS_QUANTA[state.level]
+                demoted[req_id] = state.level
+        if demoted and isinstance(self.waiting, MLFQRequestQueue):
+            for req in list(self.waiting):
+                if req.request_id in demoted:
+                    self.waiting.assign_level(req, demoted[req.request_id])
+
+    def _atlas_update_process_table(self, req_id: str) -> None:
+        state = self._plas_req_state.pop(req_id, None)
+        if state is None:
+            return
+        req = self.requests.get(req_id)
+        if req is None:
+            return
+        prog_id = self._plas_program_id(req)
+        prog = self._program_table.get(prog_id)
+        if prog is not None:
+            new_service = state.inherited_service + state.model_time
+            if self.policy == SchedulingPolicy.ATLAS:
+                prog.service = max(prog.service, new_service)
+            else:
+                prog.service = new_service
 
     def get_num_unfinished_requests(self) -> int:
         num_waiting = len(self.waiting) - self.num_waiting_for_streaming_input
