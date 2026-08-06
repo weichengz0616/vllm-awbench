@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -1260,6 +1262,43 @@ def test_get_max_concurrency_for_kv_cache_config():
         vllm_config, kv_cache_config_hybrid_model
     )
     assert max_concurrency_hybrid_model == 3
+
+
+def test_allocate_slots_reclaims_retained_blocks_before_capacity_check():
+    manager = object.__new__(KVCacheManager)
+    manager.max_model_len = 16
+    manager.empty_kv_cache_blocks = SimpleNamespace(blocks=())
+    manager.enable_caching = False
+    manager.create_kv_cache_blocks = Mock(return_value="allocated")
+    manager.coordinator = SimpleNamespace(
+        remove_skipped_blocks=Mock(),
+        get_num_blocks_to_allocate=Mock(return_value=1),
+        allocate_new_computed_blocks=Mock(),
+        allocate_new_blocks=Mock(return_value="new-blocks"),
+    )
+    free_blocks = 0
+
+    def ensure_free_blocks(num_blocks: int) -> None:
+        nonlocal free_blocks
+        assert num_blocks == 1
+        free_blocks = 1
+
+    manager.block_pool = Mock()
+    manager.block_pool.ensure_free_blocks.side_effect = ensure_free_blocks
+    manager.block_pool.get_num_free_blocks.side_effect = lambda: free_blocks
+    request = SimpleNamespace(
+        request_id="request",
+        num_computed_tokens=0,
+        num_tokens=1,
+    )
+
+    allocated = manager.allocate_slots(request, num_new_tokens=1)
+
+    assert allocated == "allocated"
+    assert manager.block_pool.mock_calls == [
+        call.ensure_free_blocks(1),
+        call.get_num_free_blocks(),
+    ]
 
 
 def test_allocate_with_lookahead():

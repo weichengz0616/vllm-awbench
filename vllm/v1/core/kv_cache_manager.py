@@ -344,6 +344,11 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
+        # KVFlow retains completed request blocks outside the free queue. Give
+        # its eviction policy a chance to reclaim them before deciding that
+        # this request cannot be scheduled.
+        self.block_pool.ensure_free_blocks(num_blocks_to_allocate)
+
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
