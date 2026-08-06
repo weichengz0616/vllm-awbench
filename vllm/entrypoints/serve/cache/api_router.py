@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+prefix_cache_router = APIRouter()
 router = APIRouter()
 
 
@@ -18,7 +19,7 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
-@router.post("/reset_prefix_cache")
+@prefix_cache_router.post("/reset_prefix_cache")
 async def reset_prefix_cache(
     raw_request: Request,
     reset_running_requests: bool = Query(default=False),
@@ -67,6 +68,7 @@ async def reset_encoder_cache(raw_request: Request):
 
 
 def attach_router(app: FastAPI):
-    if not envs.VLLM_SERVER_DEV_MODE:
-        return
-    app.include_router(router)
+    # Benchmark clients need this endpoint to isolate cache state between runs.
+    app.include_router(prefix_cache_router)
+    if envs.VLLM_SERVER_DEV_MODE:
+        app.include_router(router)

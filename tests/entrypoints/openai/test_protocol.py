@@ -4,10 +4,27 @@ from openai_harmony import (
     Message,
 )
 
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import (
     serialize_message,
     serialize_messages,
 )
+
+
+def test_chat_request_accepts_nested_awbench_meta() -> None:
+    awbench_meta = {
+        "workflow_id": "workflow",
+        "agent_steps_to_execution": {"workflow+program+agent": 0},
+        "timestep_agents": {"0": ["workflow+program+agent"]},
+    }
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "user", "content": "hello"}],
+        vllm_xargs={"awbench_meta": awbench_meta},
+    )
+
+    assert request.vllm_xargs == {"awbench_meta": awbench_meta}
 
 
 def test_serialize_message() -> None:
