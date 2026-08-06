@@ -1931,7 +1931,7 @@ def test_null_parent_block_hash():
     # Physical parent is `null_block` (no hash), while the logical parent hash
     # still exists in `request.block_hashes[num_cached_blocks - 1]`.
     assert pool.null_block.block_hash is None
-    new_blocks = pool.get_new_blocks(num_full_blocks - 1)
+    new_blocks = pool.get_new_blocks(None, num_full_blocks - 1)
     blocks = [
         new_blocks[: num_cached_blocks - 1],
         pool.null_block,  # physical parent

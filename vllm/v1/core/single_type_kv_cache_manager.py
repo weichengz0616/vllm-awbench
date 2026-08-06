@@ -398,6 +398,18 @@ class SingleTypeKVCacheManager(ABC):
 
 
 class FullAttentionManager(SingleTypeKVCacheManager):
+    def on_request_arrived(self, request: Request) -> None:
+        self.block_pool.on_request_arrived(request)
+
+    # 这个方法是用来覆盖 SingleTypeKVCacheManager 的 free
+    def free_request(self, request: Request) -> None:
+        request_id = request.request_id
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        # 注意两个调用的先后顺序
+        self.block_pool.on_request_finished(request, req_blocks)
+        self.block_pool.free_blocks(reversed(req_blocks))
+        self.num_cached_block.pop(request_id, None)
+
     @classmethod
     def find_longest_cache_hit(
         cls,

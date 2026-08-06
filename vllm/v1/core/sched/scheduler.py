@@ -263,6 +263,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            agent_eviction_policy=self.cache_config.agent_kv_eviction_policy,
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
@@ -1697,6 +1698,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
+            self.kv_cache_manager.on_request_arrived(request)
             if self._plas_enabled:
                 prog_id = self._plas_program_id(request)
                 if prog_id not in self._program_table:

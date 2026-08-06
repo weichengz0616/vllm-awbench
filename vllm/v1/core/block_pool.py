@@ -24,6 +24,11 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.kv_cache_policy import (
+    WorkflowKVCacheEntry,
+    WorkflowKVCacheKey,
+    create_kv_cache_eviction_policy,
+)
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -125,6 +130,8 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+# 不变量：
+# 1. ref cnt = 0 的 block 要么在 free block 中，要么在 workflow_kv_cache_map 中
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -151,6 +158,7 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: str = "lru",
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -160,10 +168,17 @@ class BlockPool:
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
         ]
-        # Free block queue that constructs and manipulates a doubly linked
-        # list of free blocks (including eviction candidates when caching is
-        # enabled).
+
+        # 新增了 workflow_kv_cache_map
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.workflow_kv_cache_map: dict[
+            WorkflowKVCacheKey, WorkflowKVCacheEntry
+        ] = {}
+        self.eviction_policy = create_kv_cache_eviction_policy(
+            agent_eviction_policy,
+            self.free_block_queue,
+            self.workflow_kv_cache_map,
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -171,7 +186,7 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = self.eviction_policy.pop_free_blocks(1)[0]
         self.null_block.is_null = True
 
         self.enable_kv_cache_events = enable_kv_cache_events
@@ -297,6 +312,14 @@ class BlockPool:
                 )
             )
 
+    def on_request_arrived(self, request: Request) -> None:
+        self.eviction_policy.on_request_arrived(request)
+
+    def on_request_finished(
+        self, request: Request, blocks: Sequence[KVCacheBlock]
+    ) -> None:
+        self.eviction_policy.on_request_finished(request, blocks)
+
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
@@ -308,10 +331,12 @@ class BlockPool:
         Returns:
             A list of new block.
         """
+        self.ensure_free_blocks(num_blocks)
+
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret = self.eviction_policy.pop_free_blocks(num_blocks)
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -381,7 +406,7 @@ class BlockPool:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                self.eviction_policy.on_block_touched(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -394,13 +419,20 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
-        # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:
             block.ref_cnt -= 1
-        self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
-        )
+
+        zero_ref_blocks = [
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
+        ]
+        self.eviction_policy.on_blocks_freed(zero_ref_blocks)
+
+    def ensure_free_blocks(self, num_blocks: int) -> None:
+        if num_blocks <= self.get_num_free_blocks():
+            return
+
+        self.eviction_policy.reclaim_blocks(num_blocks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """evict blocks from the prefix cache by their block IDs.
@@ -430,12 +462,14 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
-        if num_used_blocks != 1:  # The null block is always marked as used
+        num_used_blocks = sum(
+            block.ref_cnt != 0 for block in self.blocks if not block.is_null
+        )
+        if num_used_blocks != 0:
             logger.warning(
                 "Failed to reset prefix cache because some "
                 "blocks (%d) are not freed yet",
-                num_used_blocks - 1,
+                num_used_blocks,
             )
             return False
 
@@ -445,6 +479,7 @@ class BlockPool:
         # Remove all hashes from all blocks.
         for block in self.blocks:
             block.reset_hash()
+        self.eviction_policy.on_prefix_cache_reset()
 
         if self.metrics_collector:
             self.metrics_collector.reset()
@@ -462,7 +497,7 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
-        return self.free_block_queue.num_free_blocks
+        return self.eviction_policy.get_num_free_blocks()
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
