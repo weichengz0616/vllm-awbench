@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StreamOptions,
     StructuralTagResponseFormat,
     UsageInfo,
+    VllmRequestMetrics,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -509,6 +510,7 @@ class CompletionResponse(OpenAIBaseModel):
     usage: UsageInfo
 
     # vLLM-specific fields that are not in OpenAI spec
+    vllm_request_metrics: VllmRequestMetrics | None = None
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None, description="KVTransfer parameters."
     )
@@ -543,3 +545,4 @@ class CompletionStreamResponse(OpenAIBaseModel):
     # Set only on the final chunk of a stream to mirror non-streaming responses
     # without the per-chunk serialization overhead.
     system_fingerprint: str | None = None
+    vllm_request_metrics: VllmRequestMetrics | None = None

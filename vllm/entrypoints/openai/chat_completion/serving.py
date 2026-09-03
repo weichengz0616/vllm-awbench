@@ -49,6 +49,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     RequestResponseMetadata,
     ToolCall,
     UsageInfo,
+    build_vllm_request_metrics,
 )
 from vllm.entrypoints.openai.engine.serving import (
     GenerationError,
@@ -419,6 +420,9 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        final_res: RequestOutput | None = None
+        final_finish_reason: str | None = None
+        final_stop_reason: int | str | None = None
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
@@ -497,6 +501,7 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                final_res = res
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -910,12 +915,30 @@ class OpenAIServingChat(OpenAIServing):
                         finish_reason_sent[i] = True
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
+                    if choice_data.finish_reason is not None:
+                        final_finish_reason = choice_data.finish_reason
+                        final_stop_reason = choice_data.stop_reason
                     chunk = ChatCompletionStreamResponse(
                         id=request_id,
                         object=chunk_object_type,
                         created=created_time,
                         choices=[choice_data],
                         model=model_name,
+                        vllm_request_metrics=(
+                            build_vllm_request_metrics(
+                                request_id,
+                                [res.metrics],
+                                requested_max_tokens=(
+                                    request.max_completion_tokens
+                                    if request.max_completion_tokens is not None
+                                    else request.max_tokens
+                                ),
+                                finish_reason=choice_data.finish_reason,
+                                stop_reason=choice_data.stop_reason,
+                            )
+                            if choice_data.finish_reason is not None
+                            else None
+                        ),
                     )
                     # Stamp the fingerprint on terminal chunks only (those with
                     # finish_reason set). When ``include_usage`` is on, the
@@ -940,9 +963,8 @@ class OpenAIServingChat(OpenAIServing):
                     data = chunk.model_dump_json(exclude_unset=True)
                     yield f"data: {data}\n\n"
 
-            # once the final token is handled, if stream_options.include_usage
-            # is sent, send the usage
-            if include_usage:
+            # Include completed request metrics in the optional usage chunk.
+            if include_usage and final_res is not None:
                 completion_tokens = sum(previous_num_tokens)
                 final_usage = UsageInfo(
                     prompt_tokens=num_prompt_tokens,
@@ -954,6 +976,18 @@ class OpenAIServingChat(OpenAIServing):
                         cached_tokens=num_cached_tokens
                     )
 
+                request_metrics = build_vllm_request_metrics(
+                    request_id,
+                    [final_res.metrics],
+                    requested_max_tokens=(
+                        request.max_completion_tokens
+                        if request.max_completion_tokens is not None
+                        else request.max_tokens
+                    ),
+                    finish_reason=final_finish_reason,
+                    stop_reason=final_stop_reason,
+                )
+
                 final_usage_chunk = ChatCompletionStreamResponse(
                     id=request_id,
                     object=chunk_object_type,
@@ -962,6 +996,8 @@ class OpenAIServingChat(OpenAIServing):
                     model=model_name,
                     usage=final_usage,
                     system_fingerprint=self.system_fingerprint,
+                    num_kvcache_hit_tokens=num_cached_tokens or 0,
+                    vllm_request_metrics=request_metrics,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True
@@ -1403,6 +1439,18 @@ class OpenAIServingChat(OpenAIServing):
                 final_res.prompt_token_ids if request.return_token_ids else None
             ),
             prompt_text=prompt_text,
+            num_kvcache_hit_tokens=final_res.num_cached_tokens or 0,
+            vllm_request_metrics=build_vllm_request_metrics(
+                request_id,
+                [final_res.metrics],
+                requested_max_tokens=(
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens
+                ),
+                finish_reason=(choices[0].finish_reason if choices else None),
+                stop_reason=(choices[0].stop_reason if choices else None),
+            ),
             kv_transfer_params=final_res.kv_transfer_params,
         )
 

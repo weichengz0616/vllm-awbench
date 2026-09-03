@@ -30,6 +30,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     StructuralTagResponseFormat,
     ToolCall,
     UsageInfo,
+    VllmRequestMetrics,
 )
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -117,6 +118,8 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # vLLM-specific fields that are not in OpenAI spec
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None
+    num_kvcache_hit_tokens: int | None = None
+    vllm_request_metrics: VllmRequestMetrics | None = None
     # Rendered prompt text from chat templating (only set when
     # ``return_prompt_text=True`` on the request).
     prompt_text: str | None = None
@@ -147,6 +150,8 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     system_fingerprint: str | None = None
     # not part of the OpenAI spec but for tracing the tokens
     prompt_token_ids: list[int] | None = None
+    num_kvcache_hit_tokens: int | None = None
+    vllm_request_metrics: VllmRequestMetrics | None = None
     # Rendered prompt text from chat templating (only set when
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
@@ -399,11 +404,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+    vllm_xargs: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Additional request parameters with (list of) string or "
-            "numeric values, used by custom extensions."
+            "Additional JSON-serializable request parameters used by custom "
+            "extensions."
         ),
     )
 

@@ -219,6 +219,15 @@ class RequestStateStats:
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
+    # Per-request prompt token accounting for serving responses.
+    num_prompt_tokens: int = 0
+    num_cached_tokens: int = 0
+    num_recomputed_tokens: int = 0
+    num_external_computed_tokens: int = 0
+
+    num_preemptions: int = 0
+    finished_time: float = 0.0
+
 
 @dataclass
 class FinishedRequestStats:
@@ -365,6 +374,11 @@ class IterationStats:
         if is_prefilling:
             if output.prefill_stats is not None:
                 self.prompt_token_stats.update_from_output(output.prefill_stats)
+                req_stats.num_prompt_tokens = output.prefill_stats.num_prompt_tokens
+                req_stats.num_cached_tokens = output.prefill_stats.num_cached_tokens
+                req_stats.num_external_computed_tokens = (
+                    output.prefill_stats.num_external_cached_tokens
+                )
 
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
@@ -423,6 +437,7 @@ class IterationStats:
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
+                req_stats.num_preemptions += 1
                 lora_states.request_waiting(req_id, lora_name)
 
     def update_from_finished_request(
@@ -435,6 +450,7 @@ class IterationStats:
         num_cached_tokens: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
+        req_stats.finished_time = self.iteration_timestamp
 
         # Queued interval is from first QUEUED event to first SCHEDULED
         queued_time = req_stats.scheduled_ts - req_stats.queued_ts
