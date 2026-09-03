@@ -234,6 +234,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
+            agent_eviction_policy=self.cache_config.agent_kv_eviction_policy,
         )
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
@@ -1771,6 +1772,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            self.kv_cache_manager.on_request_arrived(request)
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:

@@ -64,6 +64,7 @@ from vllm.config import (
     get_attr_docs,
 )
 from vllm.config.cache import (
+    AgentKVEvictionPolicy,
     CacheDType,
     KVOffloadingBackend,
     MambaCacheMode,
@@ -702,6 +703,9 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+    agent_kv_eviction_policy: AgentKVEvictionPolicy = (
+        CacheConfig.agent_kv_eviction_policy
+    )
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1161,6 +1165,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--agent-kv-eviction-policy",
+            **cache_kwargs["agent_kv_eviction_policy"],
         )
 
         # Model weight offload related configs
@@ -1770,6 +1778,7 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            agent_kv_eviction_policy=self.agent_kv_eviction_policy,
         )
 
         if resolved_cache_dtype.startswith("turboquant_"):

@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    FullAttentionManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -42,6 +43,7 @@ class KVCacheCoordinator(ABC):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: str = "lru",
     ):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
@@ -53,6 +55,7 @@ class KVCacheCoordinator(ABC):
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
@@ -340,6 +343,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: str = "lru",
     ):
         super().__init__(
             kv_cache_config,
@@ -352,6 +356,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
         )
         self.kv_cache_spec = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = self.kv_cache_spec.block_size
@@ -369,6 +374,18 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
         assert len(self.kv_cache_config.kv_cache_groups) == 1, (
             "UnitaryKVCacheCoordinator assumes only one kv cache group"
         )
+
+    def on_request_arrived(self, request: Request) -> None:
+        manager = self.single_type_managers[0]
+        if isinstance(manager, FullAttentionManager):
+            manager.on_request_arrived(request)
+
+    def free_request(self, request: Request) -> None:
+        manager = self.single_type_managers[0]
+        if isinstance(manager, FullAttentionManager):
+            manager.free_request(request)
+        else:
+            manager.free(request.request_id)
 
     def find_longest_cache_hit(
         self,
@@ -618,6 +635,7 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    agent_eviction_policy: str = "lru",
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -632,6 +650,13 @@ def get_kv_cache_coordinator(
             metrics_collector=metrics_collector,
         )
     if len(kv_cache_config.kv_cache_groups) == 1:
+        unitary_policy = (
+            agent_eviction_policy
+            if isinstance(
+                kv_cache_config.kv_cache_groups[0].kv_cache_spec, FullAttentionSpec
+            )
+            else "lru"
+        )
         return UnitaryKVCacheCoordinator(
             kv_cache_config,
             max_model_len,
@@ -643,6 +668,7 @@ def get_kv_cache_coordinator(
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=unitary_policy,
         )
     return HybridKVCacheCoordinator(
         kv_cache_config,

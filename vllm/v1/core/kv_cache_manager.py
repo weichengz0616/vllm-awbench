@@ -8,7 +8,10 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+from vllm.v1.core.kv_cache_coordinator import (
+    UnitaryKVCacheCoordinator,
+    get_kv_cache_coordinator,
+)
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
@@ -121,6 +124,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: str = "lru",
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -149,6 +153,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -169,6 +174,10 @@ class KVCacheManager:
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
+
+    def on_request_arrived(self, request: Request) -> None:
+        if isinstance(self.coordinator, UnitaryKVCacheCoordinator):
+            self.coordinator.on_request_arrived(request)
 
     @property
     def usage(self) -> float:
@@ -356,6 +365,7 @@ class KVCacheManager:
                 num_tokens_main_model=full_num_tokens,
                 apply_admission_cap=True,
             )
+            self.block_pool.ensure_free_blocks(num_blocks_to_allocate)
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
 
@@ -384,6 +394,7 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
+        self.block_pool.ensure_free_blocks(num_blocks_to_allocate)
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
             return None
@@ -434,7 +445,10 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        if isinstance(self.coordinator, UnitaryKVCacheCoordinator):
+            self.coordinator.free_request(request)
+        else:
+            self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

@@ -14,6 +14,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
 from vllm.v1.engine import (
     EngineCoreEvent,
     EngineCoreEventType,
@@ -100,6 +101,7 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+        self.kv_cache_policy_metadata = KVRequestPolicyMetadata()
 
         if pooling_params is not None:
             # Pooling models.
@@ -114,6 +116,9 @@ class Request:
             if sampling_params.extra_args is not None:
                 self.kv_transfer_params = sampling_params.extra_args.get(
                     "kv_transfer_params"
+                )
+                self.kv_cache_policy_metadata = (
+                    KVRequestPolicyMetadata.from_extra_args(sampling_params.extra_args)
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
