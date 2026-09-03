@@ -11,7 +11,8 @@ from vllm.entrypoints.openai.engine.protocol import (
     UsageInfo,
     build_vllm_request_metrics,
 )
-from vllm.v1.metrics.stats import RequestStateStats
+from vllm.v1.engine import EngineCoreOutput
+from vllm.v1.metrics.stats import IterationStats, PrefillStats, RequestStateStats
 
 
 def make_request_stats() -> RequestStateStats:
@@ -79,6 +80,31 @@ def test_request_metrics_are_serialized_at_response_top_level() -> None:
     data = response.model_dump()
     assert data["vllm_request_metrics"]["request_id"] == "chatcmpl-request-1"
     assert data["vllm_request_metrics"]["queue_time_seconds"] == pytest.approx(0.25)
+
+
+def test_full_prefix_hit_tracks_recomputed_token() -> None:
+    prefill_stats = PrefillStats(
+        num_prompt_tokens=9,
+        num_computed_tokens=1,
+        num_cached_tokens=8,
+        num_local_cached_tokens=8,
+    )
+    request_stats = RequestStateStats(arrival_time=100.0)
+
+    IterationStats().update_from_output(
+        EngineCoreOutput(
+            request_id="request-1",
+            new_token_ids=[1],
+            prefill_stats=prefill_stats,
+        ),
+        engine_core_timestamp=10.0,
+        is_prefilling=True,
+        req_stats=request_stats,
+        lora_states=None,  # type: ignore[arg-type]
+        lora_name=None,
+    )
+
+    assert request_stats.num_recomputed_tokens == 1
 
 
 def test_chat_request_accepts_nested_awbench_meta() -> None:

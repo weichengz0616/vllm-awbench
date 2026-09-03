@@ -376,6 +376,10 @@ class IterationStats:
                 self.prompt_token_stats.update_from_output(output.prefill_stats)
                 req_stats.num_prompt_tokens = output.prefill_stats.num_prompt_tokens
                 req_stats.num_cached_tokens = output.prefill_stats.num_cached_tokens
+                req_stats.num_recomputed_tokens = int(
+                    output.prefill_stats.num_cached_tokens + 1
+                    == output.prefill_stats.num_prompt_tokens
+                )
                 req_stats.num_external_computed_tokens = (
                     output.prefill_stats.num_external_cached_tokens
                 )
