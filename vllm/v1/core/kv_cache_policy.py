@@ -71,6 +71,7 @@ class WorkflowKVCacheEntry:
     key: WorkflowKVCacheKey
     blocks: list[KVCacheBlock] = field(default_factory=list)
     score: int = 0
+    blocks_by_group: list[list[KVCacheBlock]] | None = None
 
 
 class KVCacheEvictionPolicy:
@@ -93,6 +94,13 @@ class KVCacheEvictionPolicy:
 
     def on_request_finished(
         self, request: Request | None, blocks: Sequence[KVCacheBlock]
+    ) -> None:
+        pass
+
+    def on_hybrid_request_finished(
+        self,
+        request: Request | None,
+        blocks_by_group: Sequence[Sequence[KVCacheBlock]],
     ) -> None:
         pass
 
@@ -148,6 +156,26 @@ class KVFlowPolicy(KVCacheEvictionPolicy):
         ]
         self._replace_entry_blocks(key, request, cached_blocks)
 
+    def on_hybrid_request_finished(
+        self,
+        request: Request | None,
+        blocks_by_group: Sequence[Sequence[KVCacheBlock]],
+    ) -> None:
+        if request is None:
+            return
+        key = WorkflowKVCacheKey.from_request(request)
+        if key is None:
+            return
+        cached_blocks_by_group = [
+            [
+                block
+                for block in blocks
+                if block.block_hash is not None and not block.is_null
+            ]
+            for blocks in blocks_by_group
+        ]
+        self._replace_entry_block_groups(key, request, cached_blocks_by_group)
+
     def on_block_touched(self, block: KVCacheBlock) -> None:
         if self._is_in_free_queue(block):
             self.free_block_queue.remove(block)
@@ -176,6 +204,11 @@ class KVFlowPolicy(KVCacheEvictionPolicy):
             ),
         )
         for entry in entries:
+            if entry.blocks_by_group is not None:
+                self._release_hybrid_entry(entry)
+                if self.free_block_queue.num_free_blocks >= num_blocks:
+                    return
+                continue
             while entry.blocks:
                 block = entry.blocks[-1]
                 if block.ref_cnt > 0:
@@ -192,7 +225,7 @@ class KVFlowPolicy(KVCacheEvictionPolicy):
         retained_blocks = {
             block.block_id: block
             for entry in self.workflow_kv_cache_map.values()
-            for block in entry.blocks
+            for block in self._entry_blocks(entry)
         }
         self.workflow_kv_cache_map.clear()
         self.block_id_to_workflow_keys.clear()
@@ -231,22 +264,76 @@ class KVFlowPolicy(KVCacheEvictionPolicy):
             self.block_id_to_workflow_keys.setdefault(block.block_id, set()).add(key)
         self._remove_empty_entry(entry)
 
+    def _replace_entry_block_groups(
+        self,
+        key: WorkflowKVCacheKey,
+        request: Request,
+        new_blocks_by_group: list[list[KVCacheBlock]],
+    ) -> None:
+        entry = self.workflow_kv_cache_map.get(key)
+        if entry is None:
+            entry = WorkflowKVCacheEntry(
+                key=key,
+                score=self._score_for_request(request),
+                blocks_by_group=[],
+            )
+            self.workflow_kv_cache_map[key] = entry
+
+        old_blocks = {block.block_id: block for block in self._entry_blocks(entry)}
+        new_blocks = {
+            block.block_id: block
+            for blocks in new_blocks_by_group
+            for block in blocks
+        }
+
+        for block_id in old_blocks.keys() - new_blocks.keys():
+            self._detach_block(key, old_blocks[block_id])
+        for block_id in new_blocks.keys() - old_blocks.keys():
+            block = new_blocks[block_id]
+            if self._is_in_free_queue(block):
+                raise AssertionError("A map block must not also be free")
+            self.block_id_to_workflow_keys.setdefault(block_id, set()).add(key)
+
+        entry.blocks.clear()
+        entry.blocks_by_group = new_blocks_by_group
+        self._remove_empty_entry(entry)
+
     def _detach_tail_block(self, entry: WorkflowKVCacheEntry) -> KVCacheBlock:
         block = entry.blocks.pop()
+        self._detach_block(entry.key, block)
+        return block
+
+    def _detach_block(self, key: WorkflowKVCacheKey, block: KVCacheBlock) -> None:
         keys = self.block_id_to_workflow_keys.get(block.block_id)
-        if keys is None or entry.key not in keys:
+        if keys is None or key not in keys:
             raise AssertionError("KVFlow block ownership index is inconsistent")
-        keys.remove(entry.key)
+        keys.remove(key)
         if keys:
-            return block
+            return
         self.block_id_to_workflow_keys.pop(block.block_id)
         if block.ref_cnt == 0 and not self._is_in_free_queue(block):
             self.free_block_queue.append(block)
-        return block
+
+    def _release_hybrid_entry(self, entry: WorkflowKVCacheEntry) -> None:
+        seen_block_ids: set[int] = set()
+        assert entry.blocks_by_group is not None
+        for blocks in entry.blocks_by_group:
+            for block in reversed(blocks):
+                if block.block_id in seen_block_ids:
+                    continue
+                seen_block_ids.add(block.block_id)
+                self._detach_block(entry.key, block)
+        self.workflow_kv_cache_map.pop(entry.key, None)
 
     def _remove_empty_entry(self, entry: WorkflowKVCacheEntry) -> None:
-        if not entry.blocks:
+        if not entry.blocks and not any(entry.blocks_by_group or ()):
             self.workflow_kv_cache_map.pop(entry.key, None)
+
+    @staticmethod
+    def _entry_blocks(entry: WorkflowKVCacheEntry) -> list[KVCacheBlock]:
+        if entry.blocks_by_group is None:
+            return entry.blocks
+        return [block for blocks in entry.blocks_by_group for block in blocks]
 
     def _has_other_key(self, block: KVCacheBlock, key: WorkflowKVCacheKey) -> bool:
         return any(

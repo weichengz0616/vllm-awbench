@@ -99,3 +99,35 @@ def test_kvflow_snapshot_absence_marks_entry_evictable():
 
     entry = next(iter(workflow_map.values()))
     assert entry.score == policy.INF_SCORE
+
+
+def test_kvflow_releases_hybrid_entry_as_a_unit():
+    blocks, queue = _allocated_blocks(7)
+    workflow_map = {}
+    policy = KVFlowPolicy(queue, workflow_map)
+
+    req_a = _request("a", "a", {"workflow+program+a": 9})
+    policy.on_hybrid_request_finished(req_a, [[blocks[0], blocks[1]], [blocks[2]]])
+    for block in blocks[:3]:
+        block.ref_cnt = 0
+    policy.on_blocks_freed(blocks[:3])
+
+    blocks[0].ref_cnt = 1
+    req_b = _request(
+        "b", "b", {"workflow+program+a": 9, "workflow+program+b": 1}
+    )
+    policy.on_request_arrived(req_b)
+    policy.on_hybrid_request_finished(req_b, [[blocks[0], blocks[3]], [blocks[4]]])
+    for block in (blocks[0], blocks[3], blocks[4]):
+        block.ref_cnt = 0
+    policy.on_blocks_freed([blocks[0], blocks[3], blocks[4]])
+
+    policy.reclaim_blocks(queue.num_free_blocks + 1)
+
+    assert {entry.key.agent_id for entry in workflow_map.values()} == {"b"}
+    assert policy.block_id_to_workflow_keys[blocks[0].block_id] == {
+        next(iter(workflow_map))
+    }
+    assert blocks[1].block_id not in policy.block_id_to_workflow_keys
+    assert blocks[2].block_id not in policy.block_id_to_workflow_keys
+    assert queue.num_free_blocks == 3

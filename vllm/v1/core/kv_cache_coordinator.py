@@ -15,6 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
     FullAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -79,6 +80,12 @@ class KVCacheCoordinator(ABC):
             )
             for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)
         )
+
+    def on_request_arrived(self, request: Request) -> None:
+        pass
+
+    def free_request(self, request: Request) -> None:
+        self.free(request.request_id)
 
     def get_num_blocks_to_allocate(
         self,
@@ -424,6 +431,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         pcp_world_size: int,
         hash_block_size: int,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        agent_eviction_policy: str = "lru",
     ):
         super().__init__(
             kv_cache_config,
@@ -436,6 +444,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
+            agent_eviction_policy=agent_eviction_policy,
         )
         # hash_block_size: the block size used to compute block hashes.
         # The actual block size usually equals hash_block_size, but in cases where
@@ -448,7 +457,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         ), "block_size must be divisible by hash_block_size"
         assert dcp_world_size == 1, "DCP not support hybrid attn now."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
+        self.use_kvflow = agent_eviction_policy == "kvflow"
+        if self.use_kvflow and not all(
+            isinstance(manager, FullAttentionManager)
+            or (
+                isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+            )
+            for manager in self.single_type_managers
+        ):
+            raise NotImplementedError(
+                "KVFlow hybrid eviction currently supports only full attention "
+                "and Mamba cache groups in align mode."
+            )
         self.verify_and_split_kv_cache_groups()
+
+    def on_request_arrived(self, request: Request) -> None:
+        if self.use_kvflow:
+            self.block_pool.on_request_arrived(request)
+
+    def free_request(self, request: Request) -> None:
+        if self.use_kvflow:
+            blocks_by_group = [
+                manager.get_blocks_for_eviction_policy(request.request_id)
+                for manager in self.single_type_managers
+            ]
+            self.block_pool.on_hybrid_request_finished(request, blocks_by_group)
+        self.free(request.request_id)
 
     def verify_and_split_kv_cache_groups(self) -> None:
         """
@@ -681,4 +716,5 @@ def get_kv_cache_coordinator(
         pcp_world_size=pcp_world_size,
         hash_block_size=hash_block_size,
         metrics_collector=metrics_collector,
+        agent_eviction_policy=agent_eviction_policy,
     )

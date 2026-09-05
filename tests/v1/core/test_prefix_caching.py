@@ -21,6 +21,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.v1.core.block_pool import BlockHashToBlockMap, BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager, Request
+from vllm.v1.core.kv_cache_policy import KVRequestPolicyMetadata
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     BlockHashWithGroupId,
@@ -1007,6 +1008,71 @@ def test_prefill_hybrid_model_mamba_align():
     assert len(blocks.get_block_ids()) == 2  # full_attn + mamba groups
 
     manager.free(req0)
+
+
+def test_kvflow_hybrid_retains_latest_mamba_state():
+    block_size = 16
+    kv_cache_config = _make_hybrid_kv_cache_config(
+        block_size, 30, ["full", "mamba_align", "mamba_align", "mamba_align"]
+    )
+    manager = KVCacheManager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        agent_eviction_policy="kvflow",
+    )
+    prompt_token_ids = list(range(100))
+    req = make_request("0", prompt_token_ids, block_size, sha256)
+    req.kv_cache_policy_metadata = KVRequestPolicyMetadata(
+        workflow_id="workflow",
+        program_id="program",
+        agent_id="agent",
+        agent_steps_to_execution={"workflow+program+agent": 1},
+    )
+
+    manager.on_request_arrived(req)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req)
+    allocated = manager.allocate_slots(
+        req, req.num_tokens, num_computed_tokens, computed_blocks
+    )
+    assert allocated is not None
+
+    req.num_computed_tokens = len(prompt_token_ids)
+    req.append_output_token_ids(1000)
+    for token_id in range(1001, 1100):
+        allocated = manager.allocate_slots(req, 1)
+        assert allocated is not None
+        req.num_computed_tokens += 1
+        req.append_output_token_ids(token_id)
+        if req.num_computed_tokens == 12 * block_size:
+            for mamba_manager in manager.coordinator.single_type_managers[1:]:
+                assert len(mamba_manager.get_blocks_for_eviction_policy("0")) == 2
+
+            boundary_req = make_request(
+                "boundary",
+                list(req.all_token_ids[: 12 * block_size]),
+                block_size,
+                sha256,
+            )
+            _, boundary_hit = manager.get_computed_blocks(boundary_req)
+            assert boundary_hit == 11 * block_size
+
+    manager.free(req)
+
+    entry = next(iter(manager.block_pool.workflow_kv_cache_map.values()))
+    assert entry.blocks == []
+    assert entry.blocks_by_group is not None
+    assert [len(blocks) for blocks in entry.blocks_by_group] == [12, 1, 1, 1]
+
+    next_req = make_request(
+        "1",
+        [*req.all_token_ids, 2000],
+        block_size,
+        sha256,
+    )
+    _, num_computed_tokens = manager.get_computed_blocks(next_req)
+    assert num_computed_tokens == 12 * block_size
 
 
 def test_prefill_plp():

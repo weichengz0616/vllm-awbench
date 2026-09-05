@@ -8,10 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
-from vllm.v1.core.kv_cache_coordinator import (
-    UnitaryKVCacheCoordinator,
-    get_kv_cache_coordinator,
-)
+from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.kv_cache_interface import (
@@ -176,8 +173,7 @@ class KVCacheManager:
         )
 
     def on_request_arrived(self, request: Request) -> None:
-        if isinstance(self.coordinator, UnitaryKVCacheCoordinator):
-            self.coordinator.on_request_arrived(request)
+        self.coordinator.on_request_arrived(request)
 
     @property
     def usage(self) -> float:
@@ -445,10 +441,7 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        if isinstance(self.coordinator, UnitaryKVCacheCoordinator):
-            self.coordinator.free_request(request)
-        else:
-            self.coordinator.free(request.request_id)
+        self.coordinator.free_request(request)
 
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int

@@ -164,6 +164,7 @@ class BlockPool:
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.agent_eviction_policy_name = agent_eviction_policy
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -351,6 +352,13 @@ class BlockPool:
         self, request: Request, blocks: Sequence[KVCacheBlock]
     ) -> None:
         self.eviction_policy.on_request_finished(request, blocks)
+
+    def on_hybrid_request_finished(
+        self,
+        request: Request,
+        blocks_by_group: Sequence[Sequence[KVCacheBlock]],
+    ) -> None:
+        self.eviction_policy.on_hybrid_request_finished(request, blocks_by_group)
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.

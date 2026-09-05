@@ -352,6 +352,15 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def get_blocks_for_eviction_policy(
+        self, request_id: str
+    ) -> list[KVCacheBlock]:
+        return [
+            block
+            for block in self.req_to_blocks.get(request_id, ())
+            if block.block_hash is not None and not block.is_null
+        ]
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -857,6 +866,13 @@ class MambaManager(SingleTypeKVCacheManager):
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.retain_last_cached_block = (
+            self.mamba_cache_mode == "align"
+            and block_pool.agent_eviction_policy_name == "kvflow"
+        )
+        self.retained_cached_state_block: dict[
+            str, tuple[int, KVCacheBlock]
+        ] = {}
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -922,7 +938,16 @@ class MambaManager(SingleTypeKVCacheManager):
         # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
+        if retained := self.retained_cached_state_block.get(request_id):
+            retained_block_idx, retained_block = retained
+            has_newer_checkpoint = any(
+                block.block_hash is not None and not block.is_null
+                for block in self.req_to_blocks[request_id][retained_block_idx + 1 :]
+            )
+            if has_newer_checkpoint:
+                self.retained_cached_state_block.pop(request_id)
+                self.block_pool.free_blocks([retained_block])
+
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states
@@ -939,8 +964,19 @@ class MambaManager(SingleTypeKVCacheManager):
             ):
                 blocks = self.req_to_blocks[request_id]
                 if blocks[last_state_block_idx] != self._null_block:
-                    self.block_pool.free_blocks([blocks[last_state_block_idx]])
+                    block = blocks[last_state_block_idx]
+                    if self.retain_last_cached_block and block.block_hash is not None:
+                        retained = self.retained_cached_state_block.get(request_id)
+                        if retained is not None:
+                            self.block_pool.free_blocks([retained[1]])
+                        self.retained_cached_state_block[request_id] = (
+                            last_state_block_idx,
+                            block,
+                        )
+                    else:
+                        self.block_pool.free_blocks([block])
                     blocks[last_state_block_idx] = self._null_block
+        super().remove_skipped_blocks(request_id, num_computed_tokens)
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1094,10 +1130,26 @@ class MambaManager(SingleTypeKVCacheManager):
                 return req_blocks[prev_block_len:]
 
     def free(self, request_id: str) -> None:
+        retained = self.retained_cached_state_block.pop(request_id, None)
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
         super().free(request_id)
+        if retained is not None:
+            self.block_pool.free_blocks([retained[1]])
+
+    def get_blocks_for_eviction_policy(
+        self, request_id: str
+    ) -> list[KVCacheBlock]:
+        cached_states: list[tuple[int, KVCacheBlock]] = []
+        retained = self.retained_cached_state_block.get(request_id)
+        if retained is not None:
+            cached_states.append(retained)
+        for block_idx, block in enumerate(self.req_to_blocks.get(request_id, ())):
+            if block.block_hash is not None and not block.is_null:
+                cached_states.append((block_idx, block))
+        cached_states.sort(key=lambda item: item[0])
+        return [block for _, block in cached_states[-2:]]
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """
