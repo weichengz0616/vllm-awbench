@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import msgspec
 import pytest
 import torch
 from transformers import AutoTokenizer
@@ -27,7 +28,7 @@ from vllm.platforms import current_platform
 from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreReadyResponse, EngineCoreRequest
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.engine.core_client import (
     AsyncMPClient,
@@ -95,6 +96,28 @@ def _reload_envs_module():
 def _reload_core_client_module():
     module = importlib.import_module("vllm.v1.engine.core_client")
     return importlib.reload(module)
+
+
+def test_apply_ready_response_syncs_kv_cache_block_size():
+    client = object.__new__(SyncMPClient)
+    client.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8192),
+        cache_config=SimpleNamespace(num_gpu_blocks=None, block_size=16),
+    )
+    payload = msgspec.msgpack.encode(
+        EngineCoreReadyResponse(
+            max_model_len=4096,
+            num_gpu_blocks=100,
+            block_size=784,
+            dp_stats_address=None,
+        )
+    )
+
+    client._apply_ready_response(payload)
+
+    assert client.vllm_config.model_config.max_model_len == 4096
+    assert client.vllm_config.cache_config.num_gpu_blocks == 100
+    assert client.vllm_config.cache_config.block_size == 784
 
 
 def test_mp_client_uses_env_timeout(monkeypatch: pytest.MonkeyPatch):
